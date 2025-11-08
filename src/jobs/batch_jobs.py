@@ -1,23 +1,38 @@
 """
 Batch job processor for handling scheduled ETL jobs.
+
+Enhanced batch processor with volume routing and dual writes.
 """
 
 import time
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 import pandas as pd
+import logging
 
 from .models import BatchJobConfig, JobResult, JobStatus
 from ..etl import ETLPipeline, create_pipeline_from_credentials
 from ..hudi_writer import HudiWriter, HudiWriteConfig, HudiTableConfig
+from ..core.volume_router import VolumeRouter
+# Lazy imports to avoid dependency issues
+# from ..embeddings.local_embedder import LocalEmbedder
+from ..monitoring.cost_tracker import CostTracker
+from ..quality.rules_engine import QualityRulesEngine
+# from ..destinations.dual_writer import DualDestinationWriter
+
+logger = logging.getLogger(__name__)
 
 
 class BatchJobProcessor:
-    """Processor for batch ETL jobs."""
+    """Enhanced batch processor with volume routing and dual writes."""
     
     def __init__(self):
         """Initialize batch job processor."""
-        self.hudi_writer = None
+        self.volume_router = VolumeRouter()
+        self.embedder = None  # Lazy initialization (import when needed)
+        self.cost_tracker = CostTracker()
+        self.quality_engine = QualityRulesEngine()
+        self.warehouse_writer = None
     
     def process_batch_job(self, job_config: BatchJobConfig) -> JobResult:
         """Process a batch job.
@@ -32,8 +47,10 @@ class BatchJobProcessor:
         start_time = datetime.utcnow()
         
         try:
-            # Initialize Hudi writer
-            self.hudi_writer = HudiWriter()
+            # Determine sink type (Hudi vs Iceberg)
+            sink_type = self.volume_router.determine_sink(job_config)
+            self.warehouse_writer = self.volume_router.get_writer_instance(sink_type)
+            logger.info(f"Using {sink_type} writer for job {job_config.job_id}")
             
             # Calculate date range for batch processing
             end_date = job_config.end_date or datetime.utcnow()
@@ -146,11 +163,11 @@ class BatchJobProcessor:
             )
         
         finally:
-            if self.hudi_writer:
-                self.hudi_writer.close()
+            if self.warehouse_writer and hasattr(self.warehouse_writer, 'close'):
+                self.warehouse_writer.close()
     
-    def _write_to_hudi(self, df: pd.DataFrame, job_config: BatchJobConfig) -> Any:
-        """Write DataFrame to Hudi table.
+    def _write_to_warehouse(self, df: pd.DataFrame, job_config: BatchJobConfig) -> Any:
+        """Write DataFrame to warehouse (Hudi or Iceberg).
         
         Args:
             df: DataFrame to write
@@ -159,25 +176,35 @@ class BatchJobProcessor:
         Returns:
             Write result
         """
-        # Create Hudi table configuration
-        table_config = HudiTableConfig(
-            table_name=job_config.hudi_table_name,
-            database=job_config.hudi_database,
-            base_path=job_config.hudi_base_path,
-            schema=job_config.schema or {},
-            partition_field=job_config.partition_field
-        )
+        if not self.warehouse_writer:
+            raise ValueError("Warehouse writer not initialized")
         
-        # Create Hudi write configuration
-        write_config = HudiWriteConfig(
-            table_name=job_config.hudi_table_name,
-            record_key_field="id",
-            partition_field=job_config.partition_field,
-            precombine_field="updated_at"
-        )
-        
-        # Write DataFrame
-        return self.hudi_writer.write_dataframe(df, write_config, table_config)
+        # Use appropriate writer based on type
+        if isinstance(self.warehouse_writer, HudiWriter):
+            # Hudi write
+            table_config = HudiTableConfig(
+                table_name=job_config.hudi_table_name,
+                database=job_config.hudi_database,
+                base_path=job_config.hudi_base_path,
+                schema=job_config.schema or {},
+                partition_field=job_config.partition_field
+            )
+            
+            write_config = HudiWriteConfig(
+                table_name=job_config.hudi_table_name,
+                record_key_field="id",
+                partition_field=job_config.partition_field,
+                precombine_field="updated_at"
+            )
+            
+            return self.warehouse_writer.write_dataframe(df, write_config, table_config)
+        else:
+            # Iceberg write
+            return self.warehouse_writer.write_dataframe(
+                df,
+                table_name=job_config.hudi_table_name,
+                mode="append"
+            )
     
     def validate_batch_job(self, job_config: BatchJobConfig) -> Dict[str, Any]:
         """Validate batch job configuration.

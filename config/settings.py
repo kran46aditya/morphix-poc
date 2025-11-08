@@ -5,7 +5,7 @@ Uses Pydantic Settings for validation and environment variable loading.
 Loads from .env file if present, falls back to environment variables, then defaults.
 """
 import os
-from typing import Optional
+from typing import Optional, List
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -229,6 +229,69 @@ class MinIOSettings(BaseSettings):
         return f"{protocol}://{self.endpoint}"
 
 
+class VolumeSettings(BaseSettings):
+    """Volume routing configuration."""
+    
+    model_config = SettingsConfigDict(
+        env_prefix="VOLUME_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8"
+    )
+    
+    high_volume_threshold: int = Field(default=10_000_000, description="Threshold for high-volume routing")
+    hudi_enabled: bool = Field(default=True, description="Enable Hudi writer")
+    iceberg_enabled: bool = Field(default=True, description="Enable Iceberg writer")
+
+
+class EmbeddingSettings(BaseSettings):
+    """Local embedding configuration."""
+    
+    model_config = SettingsConfigDict(
+        env_prefix="EMBEDDING_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8"
+    )
+    
+    model_name: str = Field(default="all-MiniLM-L6-v2", description="Sentence transformer model name")
+    device: str = Field(default="cpu", description="Device to use (cpu or cuda)")
+    cache_ttl_days: int = Field(default=7, description="Cache TTL in days")
+    batch_size: int = Field(default=32, description="Embedding batch size")
+    redis_host: str = Field(default="localhost", description="Redis host for cache")
+    redis_port: int = Field(default=6379, description="Redis port")
+
+
+class IcebergSettings(BaseSettings):
+    """Iceberg configuration."""
+    
+    model_config = SettingsConfigDict(
+        env_prefix="ICEBERG_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8"
+    )
+    
+    catalog_uri: str = Field(default="http://localhost:8181", description="Iceberg REST catalog URI")
+    warehouse_path: str = Field(default="s3://iceberg-warehouse", description="Warehouse path")
+    enabled: bool = Field(default=True, description="Enable Iceberg writer")
+
+
+class QualitySettings(BaseSettings):
+    """Quality rules configuration."""
+    
+    model_config = SettingsConfigDict(
+        env_prefix="QUALITY_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8"
+    )
+    
+    enabled: bool = Field(default=True, description="Enable quality checks")
+    default_rules: List[str] = Field(default=["no_nulls", "email_format"], description="Default quality rules")
+    alert_threshold: float = Field(default=80.0, description="Alert if quality score below this")
+
+
 class APISettings(BaseSettings):
     """API server configuration."""
     
@@ -280,6 +343,10 @@ class Settings(BaseSettings):
     api: APISettings = Field(default_factory=APISettings)
     trino: TrinoSettings = Field(default_factory=TrinoSettings)
     minio: MinIOSettings = Field(default_factory=MinIOSettings)
+    volume: VolumeSettings = Field(default_factory=VolumeSettings)
+    embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
+    iceberg: IcebergSettings = Field(default_factory=IcebergSettings)
+    quality: QualitySettings = Field(default_factory=QualitySettings)
     
     @field_validator("environment")
     @classmethod

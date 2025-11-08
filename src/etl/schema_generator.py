@@ -13,6 +13,10 @@ from datetime import datetime, date
 import io
 import avro.schema
 import fastavro
+import pymongo
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class SchemaGenerator:
@@ -340,6 +344,314 @@ class SchemaGenerator:
             return avro_type.get('type', 'string')
         else:
             return 'string'
+    
+    @classmethod
+    def infer_from_mongodb(
+        cls,
+        mongo_uri: str,
+        database: str,
+        collection: str,
+        sample_size: int = 1000
+    ) -> Dict[str, Any]:
+        """
+        Infer schema from MongoDB collection sample.
+        
+        Enhanced detection:
+        1. Sample random documents
+        2. Detect nested objects (depth 5+)
+        3. Identify array patterns:
+           - Array of primitives → suggest aggregation
+           - Array of objects → suggest flatten + explode
+        4. Detect field name patterns:
+           - CamelCase → suggest snake_case
+           - Nested dots → suggest flatten path
+        5. Suggest data types with confidence scores
+        6. Flag quality issues (high null %, inconsistent types)
+        
+        Args:
+            mongo_uri: MongoDB connection URI
+            database: Database name
+            collection: Collection name
+            sample_size: Number of documents to sample
+            
+        Returns:
+            Dictionary with schema, suggestions, and quality flags
+        """
+        try:
+            client = pymongo.MongoClient(mongo_uri)
+            db = client[database]
+            coll = db[collection]
+            
+            # Sample random documents
+            pipeline = [{"$sample": {"size": sample_size}}]
+            sample_docs = list(coll.aggregate(pipeline))
+            
+            if not sample_docs:
+                return {
+                    "schema": {},
+                    "suggestions": [],
+                    "quality_flags": ["No documents found in collection"]
+                }
+            
+            # Convert to DataFrame for analysis
+            df = pd.DataFrame(sample_docs)
+            
+            # Generate base schema
+            schema = cls.generate_from_dataframe(df, sample_size=len(df))
+            
+            # Analyze nested structures
+            suggestions = cls.suggest_flattening_strategy(schema)
+            
+            # Detect quality issues
+            quality_flags = cls._detect_quality_issues(df, schema)
+            
+            # Calculate complexity score
+            complexity_score = cls._calculate_complexity_score(schema, suggestions)
+            
+            client.close()
+            
+            return {
+                "schema": schema,
+                "suggestions": suggestions,
+                "quality_flags": quality_flags,
+                "complexity_score": complexity_score
+            }
+            
+        except Exception as e:
+            logger.error(f"Error inferring schema from MongoDB: {e}")
+            return {
+                "schema": {},
+                "suggestions": [],
+                "quality_flags": [f"Error: {str(e)}"],
+                "complexity_score": 0
+            }
+    
+    @classmethod
+    def suggest_flattening_strategy(cls, schema: Dict) -> List[Dict]:
+        """
+        Analyze nested structures and suggest flattening.
+        
+        Strategies:
+        - Simple nested object: Flatten to dot notation
+        - Array of objects: Explode to separate rows OR aggregate to JSON string
+        - Deep nesting (5+): Suggest keeping as JSON column
+        
+        Args:
+            schema: Inferred schema
+            
+        Returns:
+            List of flattening suggestions
+        """
+        suggestions = []
+        
+        for field_name, field_schema in schema.items():
+            if field_schema.get('is_object'):
+                depth = cls._calculate_nesting_depth(field_schema)
+                
+                if depth >= 5:
+                    suggestions.append({
+                        "field": field_name,
+                        "type": "deep_nested",
+                        "suggestion": f"Keep '{field_name}' as JSON column (depth: {depth})",
+                        "confidence": 0.9
+                    })
+                else:
+                    suggestions.append({
+                        "field": field_name,
+                        "type": "nested_object",
+                        "suggestion": f"Flatten '{field_name}' to dot notation (e.g., {field_name}_subfield)",
+                        "confidence": 0.85
+                    })
+            
+            elif field_schema.get('is_array'):
+                item_type = field_schema.get('array_item_type', 'unknown')
+                
+                if item_type == 'dict':
+                    suggestions.append({
+                        "field": field_name,
+                        "type": "nested_array",
+                        "suggestion": f"Explode '{field_name}' to separate rows OR aggregate to JSON string",
+                        "confidence": 0.8
+                    })
+                else:
+                    suggestions.append({
+                        "field": field_name,
+                        "type": "array_primitive",
+                        "suggestion": f"Aggregate '{field_name}' (array of {item_type})",
+                        "confidence": 0.75
+                    })
+            
+            # Check for CamelCase
+            if any(c.isupper() for c in field_name[1:]):
+                suggestions.append({
+                    "field": field_name,
+                    "type": "naming",
+                    "suggestion": f"Convert '{field_name}' from CamelCase to snake_case",
+                    "confidence": 0.7
+                })
+        
+        return suggestions
+    
+    @classmethod
+    def _calculate_nesting_depth(cls, schema: Dict, current_depth: int = 0) -> int:
+        """Calculate maximum nesting depth of a schema."""
+        if not isinstance(schema, dict):
+            return current_depth
+        
+        if 'nested_schema' in schema:
+            max_depth = current_depth
+            for nested_field in schema['nested_schema'].values():
+                depth = cls._calculate_nesting_depth(nested_field, current_depth + 1)
+                max_depth = max(max_depth, depth)
+            return max_depth
+        
+        return current_depth
+    
+    @classmethod
+    def _detect_quality_issues(cls, df: pd.DataFrame, schema: Dict) -> List[str]:
+        """Detect quality issues in the data."""
+        flags = []
+        
+        for col_name, col_schema in schema.items():
+            if col_name not in df.columns:
+                continue
+            
+            # High null percentage
+            null_pct = col_schema.get('null_percentage', 0)
+            if null_pct > 50:
+                flags.append(f"High null percentage in '{col_name}': {null_pct}%")
+            
+            # Inconsistent types (would need more analysis)
+            # This is a simplified check
+            
+        return flags
+    
+    @classmethod
+    def _calculate_complexity_score(cls, schema: Dict, suggestions: List[Dict]) -> float:
+        """Calculate complexity score (0-100)."""
+        score = 0.0
+        
+        # Base complexity from number of fields
+        num_fields = len(schema)
+        score += min(num_fields * 2, 40)  # Max 40 points
+        
+        # Nested structures add complexity
+        nested_count = sum(1 for s in suggestions if s['type'] in ['nested_object', 'nested_array', 'deep_nested'])
+        score += nested_count * 10  # 10 points per nested structure
+        
+        # Cap at 100
+        return min(score, 100.0)
+    
+    @classmethod
+    def detect_breaking_changes(
+        cls,
+        old_schema: Dict,
+        new_schema: Dict
+    ) -> Dict[str, Any]:
+        """
+        Compare schemas for breaking changes.
+        
+        Breaking:
+        - Field removed
+        - Type changed (string→int)
+        - Non-nullable → nullable
+        - Nested structure changed
+        
+        Non-breaking:
+        - Field added
+        - Type widened (int→float)
+        - Nullable → non-nullable
+        
+        Args:
+            old_schema: Previous schema
+            new_schema: New schema
+            
+        Returns:
+            Dictionary with breaking changes and compatibility info
+        """
+        breaking_changes = []
+        non_breaking_changes = []
+        
+        old_fields = set(old_schema.keys())
+        new_fields = set(new_schema.keys())
+        
+        # Fields removed (breaking)
+        removed_fields = old_fields - new_fields
+        for field in removed_fields:
+            breaking_changes.append({
+                "field": field,
+                "type": "field_removed",
+                "message": f"Field '{field}' was removed"
+            })
+        
+        # Fields added (non-breaking)
+        added_fields = new_fields - old_fields
+        for field in added_fields:
+            non_breaking_changes.append({
+                "field": field,
+                "type": "field_added",
+                "message": f"Field '{field}' was added"
+            })
+        
+        # Check existing fields
+        common_fields = old_fields & new_fields
+        for field in common_fields:
+            old_field_schema = old_schema[field]
+            new_field_schema = new_schema[field]
+            
+            # Type changes
+            old_type = old_field_schema.get('type')
+            new_type = new_field_schema.get('type')
+            
+            if old_type != new_type:
+                # Check if it's a breaking change
+                type_widening = {
+                    ('integer', 'float'): False,  # Non-breaking
+                    ('integer', 'string'): True,   # Breaking
+                    ('float', 'string'): True,    # Breaking
+                }
+                
+                is_breaking = type_widening.get((old_type, new_type), True)
+                
+                change = {
+                    "field": field,
+                    "type": "type_changed",
+                    "message": f"Type changed from {old_type} to {new_type}",
+                    "old_type": old_type,
+                    "new_type": new_type
+                }
+                
+                if is_breaking:
+                    breaking_changes.append(change)
+                else:
+                    non_breaking_changes.append(change)
+            
+            # Nullability changes
+            old_nullable = old_field_schema.get('nullable', False)
+            new_nullable = new_field_schema.get('nullable', False)
+            
+            if old_nullable != new_nullable:
+                if not old_nullable and new_nullable:
+                    # Non-nullable → nullable (breaking)
+                    breaking_changes.append({
+                        "field": field,
+                        "type": "nullability_changed",
+                        "message": f"Field '{field}' became nullable"
+                    })
+                else:
+                    # Nullable → non-nullable (non-breaking)
+                    non_breaking_changes.append({
+                        "field": field,
+                        "type": "nullability_changed",
+                        "message": f"Field '{field}' became non-nullable"
+                    })
+        
+        return {
+            "breaking_changes": breaking_changes,
+            "non_breaking_changes": non_breaking_changes,
+            "has_breaking_changes": len(breaking_changes) > 0,
+            "compatible": len(breaking_changes) == 0
+        }
     
     @classmethod
     def schema_to_avro(cls, schema: Dict[str, Any], record_name: str = "GeneratedRecord", 

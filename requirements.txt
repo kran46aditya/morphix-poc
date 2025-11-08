@@ -70,3 +70,8 @@ celery==5.3.4
 apscheduler==3.10.4
 # Hudi Integration
 pyhudi==0.14.0
+# Local Embeddings
+sentence-transformers==2.2.2
+torch==2.0.1
+# Iceberg Integration
+pyiceberg[pyarrow,sql-postgres]==0.5.1

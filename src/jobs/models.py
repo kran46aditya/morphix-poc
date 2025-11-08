@@ -2,7 +2,7 @@
 Job management models and configurations.
 """
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
 from enum import Enum
@@ -75,6 +75,16 @@ class JobConfig(BaseModel):
     enabled: bool = Field(default=True, description="Whether job is enabled")
     description: Optional[str] = Field(None, description="Job description")
     
+    # Volume routing
+    estimated_daily_volume: Optional[int] = Field(
+        None, 
+        description="Estimated records per day for routing"
+    )
+    force_sink_type: Optional[Literal["hudi", "iceberg"]] = Field(
+        None,
+        description="Manual override for sink selection"
+    )
+    
     # Metadata
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Job creation time")
     updated_at: datetime = Field(default_factory=datetime.utcnow, description="Last update time")
@@ -108,9 +118,10 @@ class StreamJobConfig(JobConfig):
     job_type: JobType = Field(default=JobType.STREAM, description="Job type")
     
     # Stream specific settings
-    polling_interval_seconds: int = Field(default=60, description="Polling interval in seconds")
+    polling_interval_seconds: int = Field(default=60, description="Polling interval in seconds (deprecated: use change streams)")
     batch_size: int = Field(default=1000, description="Batch size for stream processing")
     checkpoint_interval: int = Field(default=1000, description="Checkpoint interval")
+    resume_token: Optional[Dict[str, Any]] = Field(None, description="MongoDB change stream resume token for crash recovery")
     
     # Stream processing options
     real_time_processing: bool = Field(default=True, description="Enable real-time processing")

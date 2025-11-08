@@ -14,10 +14,13 @@ services:
       POSTGRES_USER: morphix_user
       POSTGRES_PASSWORD: morphix_password
       PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
     ports:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./docker-init-scripts:/docker-entrypoint-initdb.d:ro
+    command: ["postgres", "-c", "password_encryption=md5"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U morphix_user -d morphix"]
       interval: 10s
@@ -99,11 +102,13 @@ services:
         condition: service_completed_successfully
     volumes:
       - ./hive-metastore-config/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+    entrypoint: ["/bin/bash", "-c"]
     command: >
-      /bin/bash -c "
-      /opt/hive/bin/schematool -dbType postgres -initSchema -verbose ||
-      echo 'Schema may already be initialized or initialization failed';
       "
+      /opt/hive/bin/schematool -dbType postgres -initSchema -verbose
+      "
+    environment:
+      - SERVICE_NAME=metastore
     networks:
       - morphix-network
 
@@ -117,16 +122,21 @@ services:
         condition: service_healthy
       postgres-init:
         condition: service_completed_successfully
-      hive-metastore-init:
-        condition: service_completed_successfully
     environment:
       SERVICE_NAME: metastore
+      SKIP_SCHEMA_INIT: "true"
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: morphix_user
+      PGPASSWORD: morphix_password
+      PGDATABASE: metastore_db
     ports:
       - "9083:9083"
     volumes:
       - ./hive-metastore-config/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+      - ./docker-init-scripts/hive-metastore-entrypoint.sh:/opt/hive/bin/custom-entrypoint.sh:ro
       - hive-metastore-data:/opt/hive/metastore_db
-    command: /opt/hive/bin/hive --service metastore
+    entrypoint: ["/bin/bash", "/opt/hive/bin/custom-entrypoint.sh"]
     healthcheck:
       test: ["CMD-SHELL", "timeout 1 bash -c 'echo > /dev/tcp/localhost/9083' || exit 1"]
       interval: 30s
@@ -225,6 +235,53 @@ services:
     networks:
       - morphix-network
 
+  # Redis for embedding cache
+  redis:
+    image: redis:7-alpine
+    container_name: morphix-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - morphix-network
+
+  # Iceberg REST Catalog
+  iceberg-rest:
+    image: tabulario/iceberg-rest:0.5.0
+    container_name: morphix-iceberg-rest
+    ports:
+      - "8181:8181"
+    environment:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin123
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://iceberg-warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_JDBC__USER=morphix_user
+      - CATALOG_JDBC__PASSWORD=morphix_password
+      - CATALOG_JDBC__URL=jdbc:postgresql://postgres:5432/morphix
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - morphix-network
+
 volumes:
   postgres-data:
   minio-data:
@@ -233,6 +290,7 @@ volumes:
   spark-data:
   spark-worker-data:
   trino-data:
+  redis-data:
 
 networks:
   morphix-network:
