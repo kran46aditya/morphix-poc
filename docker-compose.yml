@@ -1,0 +1,240 @@
+# Note: If you encounter image pull timeouts:
+# 1. Try pulling images individually: docker pull <image-name>
+# 2. Increase Docker timeout settings
+# 3. Use a registry mirror in Docker daemon config
+# See DOCKER_TROUBLESHOOTING.md for details
+
+services:
+  # PostgreSQL - for credential and job storage
+  postgres:
+    image: postgres:15-alpine
+    container_name: morphix-postgres
+    environment:
+      POSTGRES_DB: morphix
+      POSTGRES_USER: morphix_user
+      POSTGRES_PASSWORD: morphix_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U morphix_user -d morphix"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - morphix-network
+
+  # MinIO - S3-compatible object storage for Hudi data
+  minio:
+    image: minio/minio:latest
+    container_name: morphix-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"  # API port
+      - "9001:9001"  # Console port
+    volumes:
+      - minio-data:/data
+      - minio-config:/root/.minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - morphix-network
+
+  # MinIO client for bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: morphix-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      sleep 15;
+      mc alias set myminio http://minio:9000 minioadmin minioadmin123;
+      mc mb myminio/hudi-data --ignore-existing || true;
+      mc anonymous set download myminio/hudi-data || true;
+      echo 'MinIO buckets initialized';
+      "
+    restart: on-failure
+    networks:
+      - morphix-network
+
+  # PostgreSQL Metastore Database Initialization
+  postgres-init:
+    image: postgres:15-alpine
+    container_name: morphix-postgres-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: postgres
+      PGUSER: morphix_user
+      PGPASSWORD: morphix_password
+    command: >
+      sh -c "
+      psql -h postgres -U morphix_user -d postgres -c 'CREATE DATABASE metastore_db;' || true;
+      echo 'Metastore database ready';
+      "
+    networks:
+      - morphix-network
+
+  # Hive Metastore Schema Initialization
+  hive-metastore-init:
+    image: apache/hive:3.1.3
+    container_name: morphix-hive-metastore-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./hive-metastore-config/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+    command: >
+      /bin/bash -c "
+      /opt/hive/bin/schematool -dbType postgres -initSchema -verbose ||
+      echo 'Schema may already be initialized or initialization failed';
+      "
+    networks:
+      - morphix-network
+
+  # Hive Metastore - Required for Trino to query Hudi tables
+  # Using Apache Hive image that properly runs the metastore service
+  hive-metastore:
+    image: apache/hive:3.1.3
+    container_name: morphix-hive-metastore
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+      hive-metastore-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: metastore
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./hive-metastore-config/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+      - hive-metastore-data:/opt/hive/metastore_db
+    command: /opt/hive/bin/hive --service metastore
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c 'echo > /dev/tcp/localhost/9083' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    networks:
+      - morphix-network
+
+  # Spark Master
+  spark-master:
+    image: apache/spark:latest
+    container_name: morphix-spark-master
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+        -h spark-master
+        --port 7077
+        --webui-port 8080
+    environment:
+      - SPARK_LOCAL_DIRS=/tmp
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+    ports:
+      - "8080:8080"  # Spark UI
+      - "7077:7077"  # Spark Master port
+    volumes:
+      - spark-data:/tmp/spark-events
+      - ./hudi-data:/data/hudi:rw
+    networks:
+      - morphix-network
+
+  # Spark Worker
+  spark-worker:
+    image: apache/spark:latest
+    container_name: morphix-spark-worker
+    depends_on:
+      - spark-master
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+        spark://spark-master:7077
+        --webui-port 8081
+        --memory 2g
+        --cores 2
+    environment:
+      - SPARK_LOCAL_DIRS=/tmp
+      - SPARK_MASTER=spark://spark-master:7077
+    ports:
+      - "8082:8081"  # Worker UI
+    volumes:
+      - spark-worker-data:/tmp/spark-events
+      - ./hudi-data:/data/hudi:rw
+    networks:
+      - morphix-network
+
+  # Trino Data Directory Initialization
+  trino-init:
+    image: trinodb/trino:latest
+    container_name: morphix-trino-init
+    user: "0:0"
+    volumes:
+      - trino-data:/var/lib/trino
+    command: ["/bin/bash", "-c", "mkdir -p /var/lib/trino/data && chown -R 1000:1000 /var/lib/trino && chmod -R 755 /var/lib/trino && echo 'Trino data directory initialized'"]
+    networks:
+      - morphix-network
+
+  # Trino Coordinator
+  trino:
+    image: trinodb/trino:latest
+    container_name: morphix-trino
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      trino-init:
+        condition: service_completed_successfully
+    ports:
+      - "8083:8080"  # Trino - mapped to 8083 to avoid conflicts
+    volumes:
+      - ./hudi-data:/data/hudi:rw
+      - ./trino-config:/etc/trino:ro
+      - ./trino-catalog:/etc/trino/catalog:ro
+      - trino-data:/var/lib/trino
+    environment:
+      - TRINO_ENV=development
+      # S3/MinIO configuration for Hive connector
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin123
+      - S3_ENDPOINT=http://minio:9000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - morphix-network
+
+volumes:
+  postgres-data:
+  minio-data:
+  minio-config:
+  hive-metastore-data:
+  spark-data:
+  spark-worker-data:
+  trino-data:
+
+networks:
+  morphix-network:
+    driver: bridge
+

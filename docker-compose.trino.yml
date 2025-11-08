@@ -1,0 +1,50 @@
+# Docker Compose for Trino Server
+# This sets up a Trino server that can be used with the API
+#
+# Usage:
+#   docker-compose -f docker-compose.trino.yml up -d
+#
+# The Trino server will be available at http://localhost:8080
+# Update your .env file:
+#   TRINO_HOST=localhost
+#   TRINO_PORT=8080
+
+version: '3.8'
+
+services:
+  trino:
+    image: trinodb/trino:latest
+    container_name: trino-server
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount local Hudi data path so Trino can access it
+      - ./hudi-data:/data/hudi
+      # Optional: Mount custom config
+      - ./trino-config:/etc/trino
+    environment:
+      - TRINO_ENV=development
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - morphix-network
+
+networks:
+  morphix-network:
+    driver: bridge
+
+# To use with Hive connector (for Hudi tables):
+#
+# 1. Create trino-config/catalog/hive.properties:
+#    connector.name=hive-hadoop2
+#    hive.metastore.uri=file:///data/hudi
+#
+# 2. Mount your Hudi base path:
+#    volumes:
+#      - /path/to/hudi:/data/hudi
+#
+# 3. Start with: docker-compose -f docker-compose.trino.yml up -d
+

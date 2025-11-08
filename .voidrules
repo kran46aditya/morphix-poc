@@ -1,0 +1,44 @@
+# Void Rules Configuration
+
+# General Settings
+allow_experimental_features: false
+strict_mode: true
+
+# Ignore Patterns - Files/directories to be ignored
+ignore:
+  - venv/
+  - logs/
+  - __pycache__/
+  - *.pyc
+  - *.pyo
+  - .git/
+  - .DS_Store
+
+# Build Configuration
+build:
+  timeout: 300  # seconds
+  memory_limit: 1024  # MB
+
+# Testing Configuration
+testing:
+  parallel: true
+  fail_fast: true
+
+# Security Settings
+security:
+  scan_dependencies: true
+  check_vulnerabilities: true
+
+# Code Quality
+code_quality:
+  max_complexity: 10
+  enforce_style_guide: true
+  
+# Performance Settings
+performance:
+  optimize_imports: true
+  
+# Deployment Rules
+deployment:
+  require_tests: true
+  require_approval: false

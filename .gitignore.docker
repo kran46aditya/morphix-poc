@@ -1,0 +1,9 @@
+# Docker-related files
+hudi-data/
+trino-config/logs/
+*.log
+
+# Do not commit sensitive .env files
+.env
+.env.local
+
