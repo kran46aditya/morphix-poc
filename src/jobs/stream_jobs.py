@@ -24,6 +24,16 @@ from ..connectors.cdc.mongo_changestream import ChangeStreamWatcher, CDCConfig, 
 from ..connectors.cdc.checkpoint_store import CheckpointStore
 from config.settings import get_settings
 
+# Optional schema evolution imports
+try:
+    from ..etl.schema_evaluator import SchemaEvaluator
+    from ..etl.schema_registry import SchemaRegistry
+    SCHEMA_EVOLUTION_AVAILABLE = True
+except ImportError:
+    SCHEMA_EVOLUTION_AVAILABLE = False
+    SchemaEvaluator = None
+    SchemaRegistry = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -171,12 +181,35 @@ class StreamJobProcessor:
                 pipeline_filter=self._build_change_stream_pipeline(job_config)
             )
             
+            # Setup schema evolution if available
+            schema_evaluator = None
+            current_schema = job_config.schema or {}
+            
+            if SCHEMA_EVOLUTION_AVAILABLE and job_config.schema:
+                try:
+                    settings = get_settings()
+                    schema_registry = SchemaRegistry(settings.database.connection_url)
+                    
+                    # Get latest schema from registry if available
+                    latest_schema = schema_registry.get_latest_schema(job_config.hudi_table_name)
+                    if latest_schema:
+                        current_schema = latest_schema
+                        logger.info(f"Loaded latest schema from registry for {job_config.hudi_table_name}")
+                    
+                    schema_evaluator = SchemaEvaluator(schema_registry=schema_registry)
+                    logger.info(f"Schema evolution enabled for {job_config.hudi_table_name}")
+                except Exception as e:
+                    logger.warning(f"Could not initialize schema evolution: {e}, continuing without it")
+            
             # Create ChangeStreamWatcher
             watcher = ChangeStreamWatcher(
                 collection=collection,
                 checkpoint_store=self.checkpoint_store,
                 config=cdc_config,
-                job_id=job_config.job_id
+                job_id=job_config.job_id,
+                schema_evaluator=schema_evaluator,
+                current_schema=current_schema,
+                table_name=job_config.hudi_table_name
             )
             
             # Define callback that processes batches
@@ -229,12 +262,33 @@ class StreamJobProcessor:
                 pipeline_filter=self._build_change_stream_pipeline(job_config)
             )
             
+            # Setup schema evolution if available
+            schema_evaluator = None
+            current_schema = job_config.schema or {}
+            
+            if SCHEMA_EVOLUTION_AVAILABLE and job_config.schema:
+                try:
+                    settings = get_settings()
+                    schema_registry = SchemaRegistry(settings.database.connection_url)
+                    
+                    # Get latest schema from registry if available
+                    latest_schema = schema_registry.get_latest_schema(job_config.hudi_table_name)
+                    if latest_schema:
+                        current_schema = latest_schema
+                    
+                    schema_evaluator = SchemaEvaluator(schema_registry=schema_registry)
+                except Exception as e:
+                    logger.warning(f"Could not initialize schema evolution: {e}")
+            
             # Create ChangeStreamWatcher
             watcher = ChangeStreamWatcher(
                 collection=collection,
                 checkpoint_store=self.checkpoint_store,
                 config=cdc_config,
-                job_id=job_config.job_id
+                job_id=job_config.job_id,
+                schema_evaluator=schema_evaluator,
+                current_schema=current_schema,
+                table_name=job_config.hudi_table_name
             )
             
             # Start watching (blocking, but will respect stop_event via signal handlers)

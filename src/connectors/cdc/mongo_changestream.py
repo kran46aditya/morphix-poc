@@ -22,6 +22,18 @@ import signal
 from datetime import datetime
 from bson import Timestamp
 
+# Optional schema evolution imports
+try:
+    from ...etl.schema_evaluator import SchemaEvaluator, SchemaChangeResult, ChangeType
+    from ...etl.schema_registry import SchemaRegistry
+    SCHEMA_EVOLUTION_AVAILABLE = True
+except ImportError:
+    SCHEMA_EVOLUTION_AVAILABLE = False
+    SchemaEvaluator = None
+    SchemaRegistry = None
+    SchemaChangeResult = None
+    ChangeType = None
+
 try:
     from prometheus_client import Counter, Gauge, Histogram
     PROMETHEUS_AVAILABLE = True
@@ -142,7 +154,10 @@ class ChangeStreamWatcher:
         collection: Collection,
         checkpoint_store: 'CheckpointStore',
         config: CDCConfig,
-        job_id: str
+        job_id: str,
+        schema_evaluator: Optional['SchemaEvaluator'] = None,
+        current_schema: Optional[Dict[str, Any]] = None,
+        table_name: Optional[str] = None
     ):
         """
         Initialize changestream watcher.
@@ -152,6 +167,9 @@ class ChangeStreamWatcher:
             checkpoint_store: Store for resume token persistence
             config: CDC configuration
             job_id: Job identifier for checkpoint storage
+            schema_evaluator: Optional schema evaluator for schema evolution
+            current_schema: Optional current schema for evolution detection
+            table_name: Optional table name for schema evolution
             
         Raises:
             TypeError: If collection is not valid PyMongo collection
@@ -168,6 +186,11 @@ class ChangeStreamWatcher:
         self.config = config
         self.job_id = job_id
         self.collection_name = collection.name
+        
+        # Schema evolution
+        self.schema_evaluator = schema_evaluator
+        self.current_schema = current_schema or {}
+        self.table_name = table_name or self.collection_name
         
         # State management
         self.buffer: List[Dict[str, Any]] = []
@@ -188,7 +211,8 @@ class ChangeStreamWatcher:
                 "job_id": self.job_id,
                 "collection": self.collection_name,
                 "batch_size": self.config.batch_size,
-                "batch_interval": self.config.batch_interval
+                "batch_interval": self.config.batch_interval,
+                "schema_evolution_enabled": self.schema_evaluator is not None
             }
         )
     
@@ -394,6 +418,10 @@ class ChangeStreamWatcher:
                         )
                     
                     if should_flush:
+                        # Check schema evolution before flushing
+                        if self.schema_evaluator and self.current_schema:
+                            self._check_schema_evolution(self.buffer)
+                        
                         self._flush_buffer(callback)
                 
                 # Calculate and record lag
@@ -691,4 +719,144 @@ class ChangeStreamWatcher:
             signal.signal(signal.SIGTERM, self._original_sigterm)
         if self._original_sigint is not None:
             signal.signal(signal.SIGINT, self._original_sigint)
+    
+    def _check_schema_evolution(
+        self,
+        batch: List[Dict[str, Any]]
+    ) -> Optional[SchemaChangeResult]:
+        """
+        Check batch for schema changes.
+        
+        Called before processing each batch.
+        If changes detected, evaluate and potentially evolve schema.
+        
+        Args:
+            batch: Batch of change stream documents
+            
+        Returns:
+            SchemaChangeResult if changes detected, None otherwise
+        """
+        if not self.schema_evaluator or not self.current_schema:
+            return None
+        
+        try:
+            # Extract full documents from batch
+            documents = []
+            for change in batch:
+                if change.get('operationType') in ['insert', 'update', 'replace']:
+                    doc = change.get('fullDocument')
+                    if doc:
+                        documents.append(doc)
+            
+            if not documents:
+                return None
+            
+            # Evaluate batch for schema changes
+            result = self.schema_evaluator.evaluate_batch(
+                batch=documents,
+                current_schema=self.current_schema
+            )
+            
+            if not result.changes:
+                return None
+            
+            logger.info(
+                f"Schema changes detected: {len(result.changes)} changes "
+                f"({len(result.safe_changes)} safe, {len(result.warning_changes)} warnings, "
+                f"{len(result.breaking_changes)} breaking)",
+                extra={
+                    "job_id": self.job_id,
+                    "collection": self.collection_name,
+                    "changes_count": len(result.changes),
+                    "has_breaking": result.has_breaking
+                }
+            )
+            
+            # Handle breaking changes
+            if result.has_breaking:
+                logger.error(
+                    f"BREAKING schema changes detected for {self.collection_name}:",
+                    extra={
+                        "job_id": self.job_id,
+                        "collection": self.collection_name,
+                        "breaking_changes": [
+                            {
+                                "field": c.field_name,
+                                "description": c.description
+                            }
+                            for c in result.breaking_changes
+                        ]
+                    }
+                )
+                # In production, you might want to:
+                # 1. Send alert to admin
+                # 2. Pause processing
+                # 3. Wait for manual approval
+                # For now, we log and continue (but mark as breaking)
+            
+            # Handle safe changes - auto-evolve
+            if result.has_safe:
+                logger.info(
+                    f"Auto-evolving schema for {self.collection_name} with {len(result.safe_changes)} safe changes"
+                )
+                
+                # Evolve schema
+                success = self.schema_evaluator.evolve_hudi_schema(
+                    table_name=self.table_name,
+                    changes=result.safe_changes
+                )
+                
+                if success:
+                    # Update current schema
+                    self.current_schema = self.schema_evaluator.build_evolved_schema(
+                        current_schema=self.current_schema,
+                        changes=result.safe_changes
+                    )
+                    logger.info(
+                        f"✅ Schema evolved successfully for {self.collection_name}",
+                        extra={
+                            "job_id": self.job_id,
+                            "collection": self.collection_name,
+                            "new_fields": [c.field_name for c in result.safe_changes]
+                        }
+                    )
+                else:
+                    logger.error(
+                        f"❌ Failed to evolve schema for {self.collection_name}",
+                        extra={
+                            "job_id": self.job_id,
+                            "collection": self.collection_name
+                        }
+                    )
+            
+            # Handle warnings
+            if result.has_warning:
+                logger.warning(
+                    f"Schema warnings detected for {self.collection_name}:",
+                    extra={
+                        "job_id": self.job_id,
+                        "collection": self.collection_name,
+                        "warnings": [
+                            {
+                                "field": c.field_name,
+                                "description": c.description
+                            }
+                            for c in result.warning_changes
+                        ]
+                    }
+                )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(
+                f"Error checking schema evolution: {e}",
+                extra={
+                    "job_id": self.job_id,
+                    "collection": self.collection_name,
+                    "error": str(e)
+                }
+            )
+            # Don't fail the batch processing on schema check errors
+            return None
 

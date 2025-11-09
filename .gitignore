@@ -101,3 +101,5 @@ Thumbs.db
 final_logs.txt
 final_test_end_to_end.log
 .cursor
+jars/
+jars/*.jar

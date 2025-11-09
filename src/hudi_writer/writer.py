@@ -4,9 +4,12 @@ Hudi writer for writing DataFrames to Hudi tables.
 
 import os
 import time
+import logging
 from typing import Optional, Dict, Any, Union
 from datetime import datetime
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # Optional Spark imports - will be imported when needed
 try:
@@ -38,24 +41,64 @@ class HudiWriter:
         self.spark = spark_session or self._create_spark_session()
         self._setup_hudi_config()
     
+    def _get_hudi_jar_path(self) -> Optional[str]:
+        """Get path to Hudi JAR file.
+        
+        Checks in order:
+        1. HUDI_JAR_PATH environment variable
+        2. jars/ directory in project root
+        
+        Returns:
+            Path to Hudi JAR or None if not found
+        """
+        # Check environment variable first
+        env_path = os.getenv("HUDI_JAR_PATH")
+        if env_path and os.path.exists(env_path):
+            return env_path
+        
+        # Check project jars directory
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        jars_dir = os.path.join(project_root, "jars")
+        
+        # Look for Hudi JAR in jars directory
+        if os.path.exists(jars_dir):
+            for file in os.listdir(jars_dir):
+                if file.startswith("hudi") and file.endswith(".jar"):
+                    jar_path = os.path.join(jars_dir, file)
+                    if os.path.exists(jar_path) and os.path.getsize(jar_path) > 10000:  # Valid JAR
+                        return jar_path
+        
+        return None
+    
     def _create_spark_session(self) -> SparkSession:
         """Create Spark session with Hudi configuration."""
-        return SparkSession.builder \
+        # Get Hudi JAR path
+        hudi_jar_path = self._get_hudi_jar_path()
+        
+        builder = SparkSession.builder \
             .appName("HudiWriter") \
-            .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+            .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        
+        # Add Hudi JAR to classpath FIRST (before extensions)
+        if hudi_jar_path and os.path.exists(hudi_jar_path):
+            builder = builder.config("spark.jars", hudi_jar_path)
+            logger.info(f"Using Hudi JAR: {hudi_jar_path}")
+        else:
+            logger.warning("Hudi JAR not found. Hudi operations may fail.")
+            # Return session without Hudi extensions if JAR not found
+            return builder.getOrCreate()
+        
+        # Add Hudi extensions AFTER JAR is configured
+        builder = builder \
             .config("spark.sql.extensions", "org.apache.spark.sql.hudi.HoodieSparkSessionExtension") \
             .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.hudi.catalog.HoodieCatalog") \
             .config("spark.sql.catalog.spark_catalog.type", "hudi") \
-            .config("spark.kryo.registrator", "org.apache.spark.sql.hudi.HoodieSparkKryoRegistrar") \
-            .getOrCreate()
+            .config("spark.kryo.registrator", "org.apache.spark.sql.hudi.HoodieSparkKryoRegistrar")
+        
+        return builder.getOrCreate()
     
     def _setup_hudi_config(self):
         """Setup Hudi configuration."""
-        # Set Hudi JAR path if available
-        hudi_jar_path = os.getenv("HUDI_JAR_PATH")
-        if hudi_jar_path:
-            self.spark.conf.set("spark.jars", hudi_jar_path)
-        
         # Set default Hudi properties
         self.spark.conf.set("spark.sql.adaptive.enabled", "true")
         self.spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")

@@ -1,7 +1,13 @@
 from .writer import HudiWriter
 from .table_manager import HudiTableManager
 from .schema_manager import HudiSchemaManager
-from .models import HudiTableConfig, HudiWriteConfig, HudiTableInfo
+from .models import (
+    HudiTableConfig, 
+    HudiWriteConfig, 
+    HudiTableInfo,
+    HudiTableType,
+    HudiOperationType
+)
 
 __all__ = [
     "HudiWriter",
@@ -9,5 +15,7 @@ __all__ = [
     "HudiSchemaManager",
     "HudiTableConfig",
     "HudiWriteConfig",
-    "HudiTableInfo"
+    "HudiTableInfo",
+    "HudiTableType",
+    "HudiOperationType"
 ]

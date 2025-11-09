@@ -33,14 +33,44 @@ class HudiTableManager:
     
     def _create_spark_session(self) -> SparkSession:
         """Create Spark session with Hudi configuration."""
-        return SparkSession.builder \
+        # Get Hudi JAR path (same logic as HudiWriter)
+        hudi_jar_path = self._get_hudi_jar_path()
+        
+        builder = SparkSession.builder \
             .appName("HudiTableManager") \
             .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
             .config("spark.sql.extensions", "org.apache.spark.sql.hudi.HoodieSparkSessionExtension") \
             .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.hudi.catalog.HoodieCatalog") \
             .config("spark.sql.catalog.spark_catalog.type", "hudi") \
-            .config("spark.kryo.registrator", "org.apache.spark.sql.hudi.HoodieSparkKryoRegistrar") \
-            .getOrCreate()
+            .config("spark.kryo.registrator", "org.apache.spark.sql.hudi.HoodieSparkKryoRegistrar")
+        
+        # Add Hudi JAR to classpath if available
+        if hudi_jar_path and os.path.exists(hudi_jar_path):
+            builder = builder.config("spark.jars", hudi_jar_path)
+        
+        return builder.getOrCreate()
+    
+    def _get_hudi_jar_path(self) -> Optional[str]:
+        """Get path to Hudi JAR file."""
+        import os
+        # Check environment variable first
+        env_path = os.getenv("HUDI_JAR_PATH")
+        if env_path and os.path.exists(env_path):
+            return env_path
+        
+        # Check project jars directory
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        jars_dir = os.path.join(project_root, "jars")
+        
+        # Look for Hudi JAR in jars directory
+        if os.path.exists(jars_dir):
+            for file in os.listdir(jars_dir):
+                if file.startswith("hudi") and file.endswith(".jar"):
+                    jar_path = os.path.join(jars_dir, file)
+                    if os.path.exists(jar_path):
+                        return jar_path
+        
+        return None
     
     def create_table(self, config: HudiTableConfig) -> bool:
         """Create a new Hudi table.

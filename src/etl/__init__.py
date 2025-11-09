@@ -6,6 +6,8 @@ from .mongo_api_reader import (
 )
 from .data_transformer import DataTransformer
 from .schema_generator import SchemaGenerator
+from .schema_evaluator import SchemaEvaluator, SchemaChange, SchemaChangeResult, ChangeType
+from .schema_registry import SchemaRegistry, SchemaVersion
 from .pipeline import (
     ETLPipeline,
     APIPipeline,
@@ -27,6 +29,14 @@ __all__ = [
     # Module 2: Data Transformer
     "DataTransformer",
     "SchemaGenerator",
+    
+    # Schema Evolution
+    "SchemaEvaluator",
+    "SchemaChange",
+    "SchemaChangeResult",
+    "ChangeType",
+    "SchemaRegistry",
+    "SchemaVersion",
     
     # Pipeline Integration
     "ETLPipeline",
