@@ -94,6 +94,20 @@ class SchemaGenerator:
         col_schema['nullable'] = null_count > 0
         col_schema['null_percentage'] = round((null_count / total_count) * 100, 2) if total_count > 0 else 0
         
+        # Check for object types that might be nested structures
+        if dtype_str == 'object':
+            # Sample a few values to determine if it's a dict/list
+            sample_values = series.dropna().head(5)
+            if len(sample_values) > 0:
+                first_val = sample_values.iloc[0]
+                if isinstance(first_val, dict):
+                    col_schema['type'] = 'object'
+                elif isinstance(first_val, list):
+                    col_schema['type'] = 'array'
+                elif isinstance(first_val, bytes):
+                    col_schema['type'] = 'binary'
+                # Otherwise keep as 'string'
+        
         # Get non-null values for further analysis
         non_null_values = series.dropna()
         
@@ -131,10 +145,28 @@ class SchemaGenerator:
                 
         elif col_schema['type'] == 'string':
             if include_constraints:
-                str_lengths = non_null_values.astype(str).str.len()
-                col_schema['min_length'] = int(str_lengths.min())
-                col_schema['max_length'] = int(str_lengths.max())
-                col_schema['avg_length'] = round(float(str_lengths.mean()), 2)
+                try:
+                    # Safe string conversion to handle binary/unicode issues
+                    def safe_str_convert(val):
+                        try:
+                            if isinstance(val, bytes):
+                                return val.decode('utf-8', errors='replace')
+                            return str(val)
+                        except Exception:
+                            return str(val)
+                    
+                    # Convert to string safely
+                    str_values = non_null_values.apply(safe_str_convert)
+                    str_lengths = str_values.str.len()
+                    col_schema['min_length'] = int(str_lengths.min())
+                    col_schema['max_length'] = int(str_lengths.max())
+                    col_schema['avg_length'] = round(float(str_lengths.mean()), 2)
+                except Exception as e:
+                    logger.warning(f"Could not analyze string lengths: {e}")
+                    # Set defaults
+                    col_schema['min_length'] = 0
+                    col_schema['max_length'] = 0
+                    col_schema['avg_length'] = 0
                 
             # Check for common patterns
             try:
@@ -150,9 +182,19 @@ class SchemaGenerator:
                 
             # Check for common patterns (email, phone, etc.)
             try:
-                sample_values = non_null_values.head(100).astype(str)
+                # Safe string conversion for pattern detection
+                def safe_str_convert(val):
+                    try:
+                        if isinstance(val, bytes):
+                            return val.decode('utf-8', errors='replace')
+                        return str(val)
+                    except Exception:
+                        return str(val)
+                
+                sample_values = non_null_values.head(100).apply(safe_str_convert)
                 col_schema['patterns'] = cls._detect_patterns(sample_values)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, UnicodeDecodeError) as e:
+                logger.warning(f"Could not detect patterns: {e}")
                 col_schema['patterns'] = []
             
         elif col_schema['type'] == 'boolean':

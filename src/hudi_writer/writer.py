@@ -121,11 +121,25 @@ class HudiWriter:
             # Build Hudi options
             hudi_options = self._build_write_options(config, table_config)
             
+            # Check if table exists - if not, use overwrite for first write
+            # This avoids schema merge conflicts
+            from pyspark.sql.utils import AnalysisException
+            try:
+                # Try to read the table to see if it exists
+                test_df = self.spark.read.format("hudi").load(table_path).limit(1)
+                test_df.collect()  # Force evaluation
+                table_exists = True
+            except (AnalysisException, Exception):
+                table_exists = False
+            
+            # Use overwrite for first write, append for subsequent writes
+            write_mode = "overwrite" if not table_exists else "append"
+            
             # Write DataFrame
             write_result = spark_df.write \
                 .format("hudi") \
                 .options(**hudi_options) \
-                .mode("append") \
+                .mode(write_mode) \
                 .save(table_path)
             
             # Calculate statistics

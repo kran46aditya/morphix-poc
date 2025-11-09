@@ -7,7 +7,7 @@ NOT polling - use native change streams for sub-second latency.
 
 import time
 import threading
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 import pandas as pd
 import pymongo
@@ -16,21 +16,59 @@ import logging
 
 from .models import StreamJobConfig, JobResult, JobStatus
 from ..etl import ETLPipeline, create_pipeline_from_credentials
-from ..hudi_writer import HudiWriter, HudiWriteConfig, HudiTableConfig
+from ..etl.data_transformer import DataTransformer
+from ..hudi_writer import HudiWriter, HudiWriteConfig, HudiTableConfig, HudiOperationType
 from ..core.volume_router import VolumeRouter
 from ..quality.rules_engine import QualityRulesEngine
+from ..connectors.cdc.mongo_changestream import ChangeStreamWatcher, CDCConfig, CDCError
+from ..connectors.cdc.checkpoint_store import CheckpointStore
+from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
 
 class StreamJobProcessor:
-    """Processor for stream ETL jobs."""
+    """
+    Process CDC stream jobs.
     
-    def __init__(self):
-        """Initialize stream job processor."""
-        self.hudi_writer = None
+    Integration points:
+    - ChangeStreamWatcher: Watches MongoDB changestream
+    - DataTransformer: Flattens and transforms data
+    - HudiWriter: Writes to Hudi tables
+    - CheckpointStore: Persists resume tokens
+    """
+    
+    def __init__(
+        self,
+        checkpoint_store: Optional[CheckpointStore] = None,
+        hudi_writer: Optional[HudiWriter] = None,
+        data_transformer: Optional[DataTransformer] = None
+    ):
+        """
+        Initialize stream job processor.
+        
+        Args:
+            checkpoint_store: Checkpoint store for resume tokens (optional, will create if not provided)
+            hudi_writer: Hudi writer instance (optional, will create if not provided)
+            data_transformer: Data transformer instance (optional, will create if not provided)
+        """
+        self.hudi_writer = hudi_writer
         self.running_jobs = {}
         self.stop_events = {}
+        
+        # Initialize checkpoint store if not provided
+        if checkpoint_store is None:
+            settings = get_settings()
+            self.checkpoint_store = CheckpointStore(settings.database.connection_url)
+        else:
+            self.checkpoint_store = checkpoint_store
+        
+        # Initialize data transformer if not provided
+        self.data_transformer = data_transformer
+        
+        # Initialize Hudi writer if not provided
+        if self.hudi_writer is None:
+            self.hudi_writer = HudiWriter()
     
     def start_stream_job(self, job_config: StreamJobConfig) -> str:
         """Start a stream job.
@@ -104,6 +142,64 @@ class StreamJobProcessor:
             "is_running": job_info["thread"].is_alive()
         }
     
+    def execute(self, job_config: StreamJobConfig) -> None:
+        """
+        Execute CDC stream job (blocking).
+        
+        This method:
+        1. Connects to MongoDB
+        2. Creates ChangeStreamWatcher
+        3. Starts watching (blocking)
+        4. Processes batches via callback
+        5. Writes to Hudi
+        
+        Args:
+            job_config: Stream job configuration
+            
+        Note: This is a blocking call. Run in separate thread.
+        """
+        try:
+            # Connect to MongoDB
+            client = pymongo.MongoClient(job_config.mongo_uri)
+            db = client[job_config.database]
+            collection = db[job_config.collection]
+            
+            # Create CDC config from job config
+            cdc_config = CDCConfig(
+                batch_size=job_config.batch_size,
+                batch_interval=job_config.checkpoint_interval if hasattr(job_config, 'checkpoint_interval') else 10,
+                pipeline_filter=self._build_change_stream_pipeline(job_config)
+            )
+            
+            # Create ChangeStreamWatcher
+            watcher = ChangeStreamWatcher(
+                collection=collection,
+                checkpoint_store=self.checkpoint_store,
+                config=cdc_config,
+                job_id=job_config.job_id
+            )
+            
+            # Define callback that processes batches
+            def process_batch(batch: List[Dict[str, Any]]) -> None:
+                """Process a batch of CDC changes."""
+                self._process_batch(batch, job_config)
+            
+            # Start watcher (blocking)
+            watcher.start(callback=process_batch)
+            
+        except CDCError as e:
+            logger.error(
+                f"CDC error in stream job {job_config.job_id}: {str(e)}",
+                extra={"job_id": job_config.job_id}
+            )
+            raise
+        except Exception as e:
+            logger.error(
+                f"Fatal error in stream job {job_config.job_id}: {str(e)}",
+                extra={"job_id": job_config.job_id}
+            )
+            raise
+    
     def _process_stream_job(self, job_config: StreamJobConfig, execution_id: str, stop_event: threading.Event):
         """Process stream job using MongoDB change streams.
         
@@ -113,30 +209,48 @@ class StreamJobProcessor:
             stop_event: Stop event for graceful shutdown
         """
         try:
-            # Initialize components
-            volume_router = VolumeRouter()
-            sink_type = volume_router.determine_sink(job_config)
-            warehouse_writer = volume_router.get_writer_instance(sink_type)
+            # Use the new CDC-based execute method
+            # Wrap it to handle stop_event
+            def process_batch_wrapper(batch: List[Dict[str, Any]]) -> None:
+                """Wrapper that checks stop_event."""
+                if stop_event.is_set():
+                    raise KeyboardInterrupt("Stop requested")
+                self._process_batch(batch, job_config)
             
             # Connect to MongoDB
             client = pymongo.MongoClient(job_config.mongo_uri)
             db = client[job_config.database]
             collection = db[job_config.collection]
             
-            # Start change stream
-            self.start_change_stream(
-                collection,
-                job_config,
-                execution_id,
-                stop_event,
-                warehouse_writer
+            # Create CDC config
+            cdc_config = CDCConfig(
+                batch_size=job_config.batch_size,
+                batch_interval=job_config.checkpoint_interval if hasattr(job_config, 'checkpoint_interval') else 10,
+                pipeline_filter=self._build_change_stream_pipeline(job_config)
             )
+            
+            # Create ChangeStreamWatcher
+            watcher = ChangeStreamWatcher(
+                collection=collection,
+                checkpoint_store=self.checkpoint_store,
+                config=cdc_config,
+                job_id=job_config.job_id
+            )
+            
+            # Start watching (blocking, but will respect stop_event via signal handlers)
+            watcher.start(callback=process_batch_wrapper)
             
             # Job completed
             self.running_jobs[execution_id]["status"] = JobStatus.SUCCESS
             
+        except KeyboardInterrupt:
+            logger.info(f"Stream job {execution_id} stopped by user")
+            self.running_jobs[execution_id]["status"] = JobStatus.CANCELLED
         except Exception as e:
-            logger.error(f"Fatal error in stream job {execution_id}: {str(e)}")
+            logger.error(
+                f"Fatal error in stream job {execution_id}: {str(e)}",
+                extra={"execution_id": execution_id}
+            )
             self.running_jobs[execution_id]["status"] = JobStatus.FAILED
         
         finally:
@@ -233,6 +347,95 @@ class StreamJobProcessor:
             pipeline.append({"$match": job_config.query})
         
         return pipeline
+    
+    def _process_batch(
+        self,
+        batch: List[Dict[str, Any]],
+        job_config: StreamJobConfig
+    ) -> None:
+        """
+        Process a batch of CDC changes.
+        
+        Steps:
+        1. Convert to DataFrame
+        2. Flatten nested structures
+        3. Apply schema validation
+        4. Write to Hudi (upsert)
+        
+        Args:
+            batch: List of changestream documents
+            job_config: Job configuration
+            
+        Raises:
+            Exception: On processing failure (will trigger retry)
+        """
+        if not batch:
+            return
+        
+        try:
+            # Extract documents from change events
+            records = []
+            for change in batch:
+                operation = change.get('operationType')
+                
+                if operation == 'delete':
+                    # Handle delete operations (mark as deleted)
+                    record = {
+                        '_id': change.get('documentKey', {}).get('_id'),
+                        '_deleted': True,
+                        '_deleted_at': change.get('clusterTime')
+                    }
+                    records.append(record)
+                else:
+                    # Handle insert, update, replace
+                    doc = change.get('fullDocument')
+                    if doc:
+                        records.append(doc)
+            
+            if not records:
+                return
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(records)
+            
+            # Initialize data transformer if needed
+            if self.data_transformer is None:
+                transformer = DataTransformer(schema=job_config.schema)
+            else:
+                transformer = self.data_transformer
+                if job_config.schema:
+                    transformer.schema = job_config.schema
+            
+            # Flatten nested structures
+            if job_config.flatten_data:
+                df = transformer.flatten_dataframe(df)
+            
+            # Clean data
+            if job_config.clean_data:
+                df = transformer.clean_data(df)
+            
+            # Apply schema validation
+            if job_config.apply_schema and job_config.schema:
+                df = transformer.apply_schema(df, strict=False)
+            
+            # Write to Hudi
+            if len(df) > 0:
+                write_result = self._write_to_hudi(df, job_config)
+                logger.info(
+                    f"Processed batch: {len(records)} records, wrote {write_result.records_written} to Hudi",
+                    extra={
+                        "job_id": job_config.job_id,
+                        "records_processed": len(records),
+                        "records_written": write_result.records_written
+                    }
+                )
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing batch: {e}",
+                extra={"job_id": job_config.job_id, "batch_size": len(batch)}
+            )
+            raise
     
     def _process_change_event(
         self, 
@@ -433,25 +636,42 @@ class StreamJobProcessor:
         Returns:
             Write result
         """
+        # Determine record key field (use _id if present, otherwise id)
+        record_key_field = "_id" if "_id" in df.columns else "id"
+        
+        # Determine precombine field
+        precombine_field = "updated_at"
+        if "updated_at" not in df.columns:
+            if "_deleted_at" in df.columns:
+                precombine_field = "_deleted_at"
+            elif "created_at" in df.columns:
+                precombine_field = "created_at"
+        
         # Create Hudi table configuration
         table_config = HudiTableConfig(
             table_name=job_config.hudi_table_name,
             database=job_config.hudi_database,
             base_path=job_config.hudi_base_path,
             schema=job_config.schema or {},
-            partition_field=job_config.partition_field
+            partition_field=job_config.partition_field,
+            record_key_field=record_key_field,
+            precombine_field=precombine_field
         )
+        
+        # Determine operation type (upsert for CDC)
+        operation = HudiOperationType.UPSERT
         
         # Create Hudi write configuration
         write_config = HudiWriteConfig(
             table_name=job_config.hudi_table_name,
-            record_key_field="id",
+            operation=operation,
+            record_key_field=record_key_field,
             partition_field=job_config.partition_field,
-            precombine_field="updated_at"
+            precombine_field=precombine_field
         )
         
-        # Write DataFrame
-        return self.hudi_writer.write_dataframe(df, write_config, table_config)
+        # Write DataFrame using upsert
+        return self.hudi_writer.upsert_dataframe(df, write_config, table_config)
     
     def validate_stream_job(self, job_config: StreamJobConfig) -> Dict[str, Any]:
         """Validate stream job configuration.

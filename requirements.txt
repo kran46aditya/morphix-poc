@@ -75,3 +75,9 @@ sentence-transformers==2.2.2
 torch==2.0.1
 # Iceberg Integration
 pyiceberg[pyarrow,sql-postgres]==0.5.1
+# CDC (Change Data Capture)
+tenacity==8.2.3
+prometheus-client==0.19.0
+# Testing (for integration tests)
+pytest==7.4.3
+testcontainers==4.5.1
