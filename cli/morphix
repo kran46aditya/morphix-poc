@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""
+Morphix CLI Tool
+
+Commands:
+    morphix plan create <collection>
+    morphix plan test <collection> --sample-size 1000
+    morphix plan apply <collection> --approve
+    morphix plan rollback <collection> <version>
+"""
+
+import sys
+import argparse
+from pathlib import Path
+
+# Add src to path
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from transform_plans.plan_manager import PlanManager
+from etl.schema_generator import SchemaGenerator
+from etl.data_transformer import DataTransformer
+from etl.mongo_api_reader import MongoDataReader
+from metadata.audit import AuditTrail
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+def plan_create(args):
+    """Create a new transform plan for a collection."""
+    try:
+        # Read sample data
+        reader = MongoDataReader(
+            mongo_uri=args.mongo_uri or "mongodb://localhost:27017",
+            database=args.database or "testdb",
+            collection=args.collection
+        )
+        
+        sample_df = reader.read_to_pandas(limit=args.sample_size or 1000)
+        
+        if sample_df.empty:
+            print(f"Error: No data found in collection {args.collection}")
+            return 1
+        
+        # Generate schemas
+        schema_gen = SchemaGenerator()
+        input_schema = schema_gen.generate_from_dataframe(sample_df, save_to_metadata=False, collection=None)
+        input_schema_hash = SchemaGenerator._compute_schema_hash(input_schema)
+        
+        # For demo, use same schema as output (in real usage, output schema would be different)
+        output_schema = input_schema.copy()
+        output_schema_hash = SchemaGenerator._compute_schema_hash(output_schema)
+        
+        # Create operations list (empty for now - would be populated based on schema diff)
+        operations = []
+        
+        # Create plan
+        plan_manager = PlanManager()
+        plan = plan_manager.create_plan(
+            collection=args.collection,
+            input_schema_hash=input_schema_hash,
+            output_schema_hash=output_schema_hash,
+            operations_list=operations
+        )
+        
+        print(f"Created transform plan: {plan['plan_id']}")
+        print(f"Version: {plan['version']}")
+        print(f"Collection: {plan['collection']}")
+        print(f"Operations: {len(plan['operations'])}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"Error creating plan: {e}", file=sys.stderr)
+        logger.error(f"Failed to create plan: {e}", exc_info=True)
+        return 1
+
+
+def plan_test(args):
+    """Test a transform plan on sample data."""
+    try:
+        # Get latest plan
+        plan_manager = PlanManager()
+        plans = plan_manager.list_plans(args.collection)
+        
+        if not plans:
+            print(f"Error: No plans found for collection {args.collection}")
+            return 1
+        
+        plan = plans[0]  # Use latest plan
+        
+        # Read sample data
+        reader = MongoDataReader(
+            mongo_uri=args.mongo_uri or "mongodb://localhost:27017",
+            database=args.database or "testdb",
+            collection=args.collection
+        )
+        
+        sample_df = reader.read_to_pandas(limit=args.sample_size or 1000)
+        
+        if sample_df.empty:
+            print(f"Error: No data found in collection {args.collection}")
+            return 1
+        
+        # Apply plan (if approved)
+        if not plan.get("approved", False):
+            print(f"Warning: Plan {plan['plan_id']} is not approved. Testing anyway...")
+        
+        transformer = DataTransformer()
+        transformed_df = transformer.apply_repair_plan(plan, sample_df)
+        
+        print(f"Test completed successfully")
+        print(f"Original rows: {len(sample_df)}")
+        print(f"Transformed rows: {len(transformed_df)}")
+        print(f"Original columns: {len(sample_df.columns)}")
+        print(f"Transformed columns: {len(transformed_df.columns)}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"Error testing plan: {e}", file=sys.stderr)
+        logger.error(f"Failed to test plan: {e}", exc_info=True)
+        return 1
+
+
+def plan_apply(args):
+    """Apply a transform plan to a collection."""
+    try:
+        # Get plan
+        plan_manager = PlanManager()
+        
+        if args.version:
+            plan = plan_manager.get_plan(args.collection, args.version)
+        else:
+            plans = plan_manager.list_plans(args.collection)
+            if not plans:
+                print(f"Error: No plans found for collection {args.collection}")
+                return 1
+            plan = plans[0]  # Use latest plan
+        
+        if not plan:
+            print(f"Error: Plan not found")
+            return 1
+        
+        # Check approval
+        if not plan.get("approved", False):
+            if not args.approve:
+                print(f"Error: Plan {plan['plan_id']} is not approved. Use --approve flag to approve and apply.")
+                return 1
+            else:
+                # Approve plan
+                approved_by = args.approved_by or "cli_user"
+                plan_manager.approve_plan(args.collection, plan['version'], approved_by)
+                plan = plan_manager.get_plan(args.collection, plan['version'])
+        
+        print(f"Applying plan {plan['plan_id']} to collection {args.collection}...")
+        print("Note: Actual data transformation would happen here in production")
+        
+        # Mark as applied
+        plan_manager.mark_plan_applied(args.collection, plan['version'])
+        
+        print(f"Plan applied successfully")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"Error applying plan: {e}", file=sys.stderr)
+        logger.error(f"Failed to apply plan: {e}", exc_info=True)
+        return 1
+
+
+def plan_rollback(args):
+    """Rollback a transform plan."""
+    try:
+        plan_manager = PlanManager()
+        plan = plan_manager.get_plan(args.collection, args.version)
+        
+        if not plan:
+            print(f"Error: Plan version {args.version} not found for collection {args.collection}")
+            return 1
+        
+        rollback_plan = plan.get("rollback_plan", [])
+        
+        if not rollback_plan:
+            print(f"Error: No rollback plan available for version {args.version}")
+            return 1
+        
+        print(f"Rolling back plan version {args.version} for collection {args.collection}...")
+        print(f"Rollback operations: {len(rollback_plan)}")
+        print("Note: Actual rollback would happen here in production")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"Error rolling back plan: {e}", file=sys.stderr)
+        logger.error(f"Failed to rollback plan: {e}", exc_info=True)
+        return 1
+
+
+def main():
+    """Main CLI entry point."""
+    parser = argparse.ArgumentParser(description="Morphix CLI Tool")
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    
+    # Plan commands
+    plan_parser = subparsers.add_parser("plan", help="Transform plan management")
+    plan_subparsers = plan_parser.add_subparsers(dest="plan_command", help="Plan command")
+    
+    # plan create
+    create_parser = plan_subparsers.add_parser("create", help="Create a new transform plan")
+    create_parser.add_argument("collection", help="Collection name")
+    create_parser.add_argument("--mongo-uri", help="MongoDB URI")
+    create_parser.add_argument("--database", help="Database name")
+    create_parser.add_argument("--sample-size", type=int, default=1000, help="Sample size")
+    
+    # plan test
+    test_parser = plan_subparsers.add_parser("test", help="Test a transform plan")
+    test_parser.add_argument("collection", help="Collection name")
+    test_parser.add_argument("--mongo-uri", help="MongoDB URI")
+    test_parser.add_argument("--database", help="Database name")
+    test_parser.add_argument("--sample-size", type=int, default=1000, help="Sample size")
+    
+    # plan apply
+    apply_parser = plan_subparsers.add_parser("apply", help="Apply a transform plan")
+    apply_parser.add_argument("collection", help="Collection name")
+    apply_parser.add_argument("--version", type=int, help="Plan version (defaults to latest)")
+    apply_parser.add_argument("--approve", action="store_true", help="Approve plan before applying")
+    apply_parser.add_argument("--approved-by", help="User who approves")
+    
+    # plan rollback
+    rollback_parser = plan_subparsers.add_parser("rollback", help="Rollback a transform plan")
+    rollback_parser.add_argument("collection", help="Collection name")
+    rollback_parser.add_argument("version", type=int, help="Plan version to rollback")
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return 1
+    
+    if args.command == "plan":
+        if args.plan_command == "create":
+            return plan_create(args)
+        elif args.plan_command == "test":
+            return plan_test(args)
+        elif args.plan_command == "apply":
+            return plan_apply(args)
+        elif args.plan_command == "rollback":
+            return plan_rollback(args)
+        else:
+            plan_parser.print_help()
+            return 1
+    else:
+        parser.print_help()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

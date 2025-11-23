@@ -4,8 +4,10 @@ Job manager for creating, scheduling, and monitoring ETL jobs.
 
 import os
 import uuid
+import json
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
+from pathlib import Path
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -15,6 +17,8 @@ from .models import (
     JobConfig, BatchJobConfig, StreamJobConfig, JobStatus, JobType,
     JobResult, JobExecution, JobMetrics, JobAlert, JobDependency
 )
+from ..utils.logging import get_logger
+from enum import Enum
 
 # Database setup - use centralized configuration
 try:
@@ -101,12 +105,27 @@ def _create_tables():
         print("Tables will be created when database is available")
 
 
+# Job state machine states
+class JobRunState(str, Enum):
+    """Job run state enumeration."""
+    RECEIVED = "RECEIVED"
+    VALIDATED = "VALIDATED"
+    RUNNING = "RUNNING"
+    FINISHED = "FINISHED"
+    FAILED = "FAILED"
+    VALIDATION_FAILED = "VALIDATION_FAILED"
+
+
 class JobManager:
     """Manager for job operations."""
+    
+    # Metadata directory for job runs (configurable via METADATA_BASE env var)
+    METADATA_BASE = Path(os.getenv("METADATA_BASE", "/metadata"))
     
     def __init__(self):
         """Initialize job manager."""
         self.db = SessionLocal()
+        self.logger = get_logger(__name__)
         # Try to create tables on first use
         try:
             _create_tables()
@@ -299,7 +318,7 @@ class JobManager:
             raise RuntimeError(f"Failed to update job status: {str(e)}")
     
     def start_job(self, job_id: str, triggered_by: str = "manual") -> Optional[str]:
-        """Start job execution.
+        """Start job execution with state machine.
         
         Args:
             job_id: Job identifier
@@ -319,13 +338,28 @@ class JobManager:
             
             # Generate execution ID
             execution_id = str(uuid.uuid4())
+            start_ts = datetime.utcnow()
+            
+            # Initialize job run state: RECEIVED
+            self._persist_job_run(
+                execution_id=execution_id,
+                job_id=job_id,
+                state=JobRunState.RECEIVED,
+                start_ts=start_ts,
+                triggered_by=triggered_by,
+                job_config=job_config
+            )
+            
+            # Transition to VALIDATED (validation happens in before_run)
+            # For now, we'll transition to RUNNING directly
+            # In Sprint 2, validation will happen in before_run()
             
             # Create execution record
             db_execution = JobExecutionDB(
                 execution_id=execution_id,
                 job_id=job_id,
                 status=JobStatus.RUNNING.value,
-                started_at=datetime.utcnow(),
+                started_at=start_ts,
                 triggered_by=triggered_by,
                 job_config=job_config.dict()
             )
@@ -335,8 +369,11 @@ class JobManager:
             # Update job last run
             db_job = self.db.query(JobDB).filter(JobDB.job_id == job_id).first()
             if db_job:
-                db_job.last_run = datetime.utcnow()
+                db_job.last_run = start_ts
                 db_job.status = JobStatus.RUNNING.value
+            
+            # Transition to RUNNING
+            self._update_job_run_state(execution_id, JobRunState.RUNNING)
             
             self.db.commit()
             
@@ -344,7 +381,271 @@ class JobManager:
             
         except Exception as e:
             self.db.rollback()
+            # Update state to FAILED
+            try:
+                self._update_job_run_state(execution_id, JobRunState.FAILED, error_summary=str(e))
+            except:
+                pass
             raise RuntimeError(f"Failed to start job: {str(e)}")
+    
+    def before_run(self, execution_id: str, job_config: JobConfig, sample_df=None) -> bool:
+        """Validate job before running (called before actual execution).
+        
+        Runs GX suite if sample data is provided.
+        
+        Args:
+            execution_id: Execution identifier
+            job_config: Job configuration
+            sample_df: Optional sample DataFrame for validation
+            
+        Returns:
+            True if validation passes, False otherwise
+        """
+        try:
+            # Transition to VALIDATED state
+            self._update_job_run_state(execution_id, JobRunState.VALIDATED)
+            
+            # Run GX suite if sample data is provided
+            if sample_df is not None:
+                try:
+                    from ..quality.gx_builder import generate_suite
+                    from ..quality.gx_runner import run_suite
+                    
+                    # Generate suite from sample
+                    suite = generate_suite(sample_df, suite_name=f"{job_config.collection}_suite")
+                    
+                    if suite:
+                        # Run suite
+                        result = run_suite(
+                            suite, 
+                            sample_df, 
+                            collection=job_config.collection,
+                            save_results=True
+                        )
+                        
+                        if not result.get("passed", False):
+                            # Validation failed
+                            failed_count = len(result.get("failed_expectations", []))
+                            error_summary = f"GX validation failed: {failed_count} expectations failed"
+                            
+                            self.logger.error(
+                                error_summary,
+                                extra={
+                                    'event_type': 'gx_validation_failed',
+                                    'execution_id': execution_id,
+                                    'job_id': job_config.job_id,
+                                    'collection': job_config.collection,
+                                    'failed_count': failed_count
+                                }
+                            )
+                            
+                            self._update_job_run_state(
+                                execution_id, 
+                                JobRunState.VALIDATION_FAILED, 
+                                error_summary=error_summary
+                            )
+                            return False
+                        else:
+                            self.logger.info(
+                                "GX validation passed",
+                                extra={
+                                    'event_type': 'gx_validation_passed',
+                                    'execution_id': execution_id,
+                                    'job_id': job_config.job_id,
+                                    'collection': job_config.collection
+                                }
+                            )
+                except ImportError:
+                    # GX not available, skip validation
+                    self.logger.warning(
+                        "Great Expectations not available, skipping validation",
+                        extra={
+                            'event_type': 'gx_validation_skipped',
+                            'execution_id': execution_id,
+                            'job_id': job_config.job_id
+                        }
+                    )
+                except Exception as e:
+                    # GX validation error
+                    error_summary = f"GX validation error: {str(e)}"
+                    self.logger.error(
+                        error_summary,
+                        exc_info=True,
+                        extra={
+                            'event_type': 'gx_validation_error',
+                            'execution_id': execution_id,
+                            'job_id': job_config.job_id,
+                            'error': str(e)
+                        }
+                    )
+                    self._update_job_run_state(
+                        execution_id, 
+                        JobRunState.VALIDATION_FAILED, 
+                        error_summary=error_summary
+                    )
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(
+                f"Validation failed for execution {execution_id}: {e}",
+                exc_info=True,
+                extra={
+                    'event_type': 'job_validation_error',
+                    'execution_id': execution_id,
+                    'job_id': job_config.job_id,
+                    'error': str(e)
+                }
+            )
+            self._update_job_run_state(execution_id, JobRunState.VALIDATION_FAILED, error_summary=str(e))
+            return False
+    
+    def _persist_job_run(self, execution_id: str, job_id: str, state: str, 
+                        start_ts: datetime, triggered_by: str, 
+                        job_config: JobConfig, end_ts: Optional[datetime] = None,
+                        duration_ms: Optional[float] = None, retry_count: int = 0,
+                        error_summary: Optional[str] = None):
+        """Persist job run information to job_run.json file.
+        
+        Args:
+            execution_id: Execution identifier
+            job_id: Job identifier
+            state: Current job run state
+            start_ts: Start timestamp
+            triggered_by: What triggered the execution
+            job_config: Job configuration
+            end_ts: End timestamp (optional)
+            duration_ms: Duration in milliseconds (optional)
+            retry_count: Number of retries
+            error_summary: Error summary if failed (optional)
+        """
+        try:
+            # Create metadata directory structure
+            metadata_dir = self.METADATA_BASE / "job_runs" / job_id
+            metadata_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create job run document
+            job_run = {
+                "execution_id": execution_id,
+                "job_id": job_id,
+                "state": state,
+                "start_ts": start_ts.isoformat() + "Z",
+                "end_ts": end_ts.isoformat() + "Z" if end_ts else None,
+                "duration_ms": duration_ms,
+                "retry_count": retry_count,
+                "triggered_by": triggered_by,
+                "error_summary": error_summary,
+                "job_name": job_config.job_name,
+                "job_type": job_config.job_type.value,
+                "collection": job_config.collection,
+                "database": job_config.database
+            }
+            
+            # Write to file with deterministic filename
+            job_run_file = metadata_dir / f"{execution_id}.json"
+            with open(job_run_file, 'w') as f:
+                json.dump(job_run, f, indent=2, default=str)
+            
+            self.logger.info(
+                f"Job run persisted to {job_run_file}",
+                extra={
+                    'event_type': 'job_run_persisted',
+                    'execution_id': execution_id,
+                    'job_id': job_id,
+                    'state': state,
+                    'job_run_file': str(job_run_file)
+                }
+            )
+            
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to persist job run: {e}",
+                exc_info=True,
+                extra={
+                    'event_type': 'job_run_persist_error',
+                    'execution_id': execution_id,
+                    'job_id': job_id,
+                    'error': str(e)
+                }
+            )
+    
+    def _update_job_run_state(self, execution_id: str, state: str, 
+                              error_summary: Optional[str] = None):
+        """Update job run state and persist to file.
+        
+        Args:
+            execution_id: Execution identifier
+            state: New state
+            error_summary: Error summary if failed (optional)
+        """
+        try:
+            # Find existing job run file
+            metadata_dir = self.METADATA_BASE / "job_runs"
+            job_run_file = None
+            
+            # Search for the execution file
+            for job_dir in metadata_dir.iterdir():
+                if job_dir.is_dir():
+                    potential_file = job_dir / f"{execution_id}.json"
+                    if potential_file.exists():
+                        job_run_file = potential_file
+                        break
+            
+            if job_run_file and job_run_file.exists():
+                # Read existing job run
+                with open(job_run_file, 'r') as f:
+                    job_run = json.load(f)
+                
+                # Update state
+                job_run["state"] = state
+                
+                # Update end_ts and duration if finishing
+                if state in [JobRunState.FINISHED, JobRunState.FAILED, JobRunState.VALIDATION_FAILED]:
+                    if job_run.get("end_ts") is None:
+                        end_ts = datetime.utcnow()
+                        start_ts = datetime.fromisoformat(job_run["start_ts"].replace("Z", "+00:00"))
+                        duration_ms = (end_ts - start_ts).total_seconds() * 1000
+                        job_run["end_ts"] = end_ts.isoformat() + "Z"
+                        job_run["duration_ms"] = round(duration_ms, 2)
+                
+                # Update error summary if provided
+                if error_summary:
+                    job_run["error_summary"] = error_summary
+                
+                # Write back
+                with open(job_run_file, 'w') as f:
+                    json.dump(job_run, f, indent=2, default=str)
+                
+                self.logger.info(
+                    f"Job run state updated to {state}",
+                    extra={
+                        'event_type': 'job_run_state_updated',
+                        'execution_id': execution_id,
+                        'state': state,
+                        'job_run_file': str(job_run_file)
+                    }
+                )
+            else:
+                self.logger.warning(
+                    f"Job run file not found for execution {execution_id}",
+                    extra={
+                        'event_type': 'job_run_file_not_found',
+                        'execution_id': execution_id
+                    }
+                )
+                
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to update job run state: {e}",
+                exc_info=True,
+                extra={
+                    'event_type': 'job_run_state_update_error',
+                    'execution_id': execution_id,
+                    'state': state,
+                    'error': str(e)
+                }
+            )
     
     def complete_job(self, execution_id: str, result: JobResult) -> bool:
         """Complete job execution.
@@ -363,6 +664,25 @@ class JobManager:
             
             if not db_execution:
                 return False
+            
+            # Determine final state
+            if result.status == JobStatus.SUCCESS:
+                final_state = JobRunState.FINISHED
+            elif result.status == JobStatus.FAILED:
+                final_state = JobRunState.FAILED
+            else:
+                final_state = JobRunState.FINISHED  # Default
+            
+            # Update job run state
+            error_summary = result.error_message
+            if result.error_details:
+                error_summary = f"{error_summary or ''} | {json.dumps(result.error_details)}"
+            
+            self._update_job_run_state(
+                execution_id, 
+                final_state,
+                error_summary=error_summary
+            )
             
             # Update execution
             db_execution.status = result.status.value
@@ -493,6 +813,71 @@ class JobManager:
             return StreamJobConfig(**config_data)
         else:
             return JobConfig(**config_data)
+    
+    def run(self, job_id: str, backfill: bool = False, 
+            timestamp_field: Optional[str] = None,
+            change_token: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Run job with optional backfill mode.
+        
+        Args:
+            job_id: Job identifier
+            backfill: If True, perform full scan. If False, use incremental mode
+            timestamp_field: Field name for timestamp-based incremental reads (optional)
+            change_token: Change token for incremental reads (optional)
+            
+        Returns:
+            Execution ID or None
+        """
+        try:
+            job_config = self.get_job(job_id)
+            if not job_config:
+                return None
+            
+            # Start job execution
+            execution_id = self.start_job(job_id, triggered_by="backfill" if backfill else "incremental")
+            if not execution_id:
+                return None
+            
+            # Log backfill mode
+            if backfill:
+                self.logger.info(
+                    f"Running job {job_id} in backfill mode (full scan)",
+                    extra={
+                        'event_type': 'job_backfill_started',
+                        'job_id': job_id,
+                        'execution_id': execution_id
+                    }
+                )
+            else:
+                self.logger.info(
+                    f"Running job {job_id} in incremental mode",
+                    extra={
+                        'event_type': 'job_incremental_started',
+                        'job_id': job_id,
+                        'execution_id': execution_id,
+                        'timestamp_field': timestamp_field,
+                        'has_change_token': change_token is not None
+                    }
+                )
+            
+            # The actual job execution would happen here
+            # This is a placeholder - actual implementation would call the appropriate processor
+            # based on job type (batch vs stream)
+            
+            return execution_id
+            
+        except Exception as e:
+            self.logger.error(
+                f"Failed to run job: {e}",
+                exc_info=True,
+                extra={
+                    'event_type': 'job_run_error',
+                    'job_id': job_id,
+                    'backfill': backfill,
+                    'error': str(e)
+                }
+            )
+            return None
     
     def _db_execution_to_job_execution(self, db_execution: JobExecutionDB) -> JobExecution:
         """Convert database execution to JobExecution."""

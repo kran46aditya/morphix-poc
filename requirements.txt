@@ -81,3 +81,7 @@ prometheus-client==0.19.0
 # Testing (for integration tests)
 pytest==7.4.3
 testcontainers==4.5.1
+# Optional: Great Expectations (for quality checks)
+# great-expectations>=0.18.0
+# Optional: ClickHouse connector (for ClickHouse writer)
+# clickhouse-connect>=0.6.0

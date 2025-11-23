@@ -11,6 +11,7 @@ import pandas as pd
 from datetime import datetime, date
 import re
 from .schema_generator import SchemaGenerator
+from ..utils.logging import get_logger
 
 
 class DataTransformer:
@@ -26,6 +27,7 @@ class DataTransformer:
         self.transformations = []
         self.validation_errors = []
         self.schema_source = None  # Track where schema came from
+        self.logger = get_logger(__name__)
         
     def add_transformation(self, func: Callable[[pd.DataFrame], pd.DataFrame], name: str = None):
         """Add a custom transformation function to the pipeline.
@@ -528,3 +530,95 @@ class DataTransformer:
         
         self.schema_source = f"merged_{strategy}"
         return self.schema
+    
+    def apply_repair_plan(self, plan: Dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
+        """Apply repair plan to DataFrame.
+        
+        Requires plan.approved = True to execute. Refuses execution otherwise.
+        
+        Args:
+            plan: Repair plan dictionary with 'approved' flag and 'operations' list
+            df: DataFrame to transform
+            
+        Returns:
+            Transformed DataFrame
+            
+        Raises:
+            ValueError: If plan is not approved
+        """
+        if not plan.get("approved", False):
+            error_msg = "Repair plan not approved. Cannot apply unapproved repairs."
+            self.logger.error(
+                error_msg,
+                extra={
+                    'event_type': 'repair_plan_rejected',
+                    'plan_id': plan.get("plan_id", "unknown"),
+                    'approved': False
+                }
+            )
+            raise ValueError(error_msg)
+        
+        self.logger.info(
+            f"Applying approved repair plan: {plan.get('plan_id', 'unknown')}",
+            extra={
+                'event_type': 'repair_plan_applied',
+                'plan_id': plan.get("plan_id", "unknown"),
+                'operation_count': len(plan.get("operations", []))
+            }
+        )
+        
+        transformed_df = df.copy()
+        operations = plan.get("operations", [])
+        
+        for operation in operations:
+            op_type = operation.get("type")
+            field = operation.get("field")
+            
+            try:
+                if op_type == "type_conversion":
+                    target_type = operation.get("target_type")
+                    if target_type == "integer":
+                        transformed_df[field] = pd.to_numeric(transformed_df[field], errors='coerce').astype('Int64')
+                    elif target_type == "float":
+                        transformed_df[field] = pd.to_numeric(transformed_df[field], errors='coerce')
+                    elif target_type == "string":
+                        transformed_df[field] = transformed_df[field].astype(str)
+                    elif target_type == "boolean":
+                        transformed_df[field] = transformed_df[field].astype(bool)
+                
+                elif op_type == "add_field":
+                    default_value = operation.get("default_value")
+                    transformed_df[field] = default_value
+                
+                elif op_type == "remove_field":
+                    if field in transformed_df.columns:
+                        transformed_df = transformed_df.drop(columns=[field])
+                
+                elif op_type == "fill_null":
+                    fill_value = operation.get("fill_value")
+                    transformed_df[field] = transformed_df[field].fillna(fill_value)
+                
+                self.logger.debug(
+                    f"Applied repair operation: {op_type} on field {field}",
+                    extra={
+                        'event_type': 'repair_operation_applied',
+                        'operation_type': op_type,
+                        'field': field
+                    }
+                )
+                
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to apply repair operation: {e}",
+                    exc_info=True,
+                    extra={
+                        'event_type': 'repair_operation_error',
+                        'operation_type': op_type,
+                        'field': field,
+                        'error': str(e)
+                    }
+                )
+                # Continue with other operations
+                continue
+        
+        return transformed_df

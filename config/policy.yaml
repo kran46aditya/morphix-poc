@@ -1,0 +1,39 @@
+# Morphix Policy Configuration
+# This file defines data governance rules and restrictions
+
+# Globally blocked fields (cannot be used in any collection)
+blocked_fields:
+  - "password"
+  - "ssn"
+  - "credit_card"
+  - "_id"  # MongoDB internal ID
+
+# Globally restricted operations
+restricted_operations:
+  - "delete"
+  - "drop_collection"
+
+# Operations that require manual approval
+require_manual_approval:
+  - "schema_change"
+  - "bulk_write"
+  - "data_repair"
+
+# Collection-specific policies
+collections:
+  users:
+    blocked_fields:
+      - "api_key"
+      - "secret_token"
+    restricted_operations:
+      - "update"
+    require_manual_approval:
+      - "write"
+  
+  transactions:
+    blocked_fields:
+      - "card_number"
+    require_manual_approval:
+      - "write"
+      - "schema_change"
+

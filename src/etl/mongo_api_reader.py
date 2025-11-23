@@ -8,7 +8,10 @@ It supports both direct connection and API-based reading.
 from typing import Optional, Dict, Any, Union, Tuple
 import json
 import pandas as pd
+import time
+import hashlib
 from ..mongodb import connection as mongo_conn
+from ..utils.logging import get_logger, CorrelationContext
 
 
 class MongoDataReader:
@@ -25,6 +28,39 @@ class MongoDataReader:
         self.mongo_uri = mongo_uri
         self.database = database
         self.collection = collection
+        self.logger = get_logger(__name__)
+    
+    def _compute_schema_fingerprint(self, df: pd.DataFrame) -> str:
+        """Compute schema fingerprint from DataFrame.
+        
+        Args:
+            df: DataFrame to fingerprint
+            
+        Returns:
+            SHA256 hash of sorted keys and basic types
+        """
+        if df.empty:
+            return hashlib.sha256(b"").hexdigest()
+        
+        # Create deterministic schema representation
+        schema_parts = []
+        for col in sorted(df.columns):
+            dtype = str(df[col].dtype)
+            # Normalize dtype to basic types
+            if 'int' in dtype:
+                dtype = 'integer'
+            elif 'float' in dtype:
+                dtype = 'float'
+            elif 'bool' in dtype:
+                dtype = 'boolean'
+            elif 'datetime' in dtype:
+                dtype = 'datetime'
+            else:
+                dtype = 'string'
+            schema_parts.append(f"{col}:{dtype}")
+        
+        schema_str = "|".join(schema_parts)
+        return hashlib.sha256(schema_str.encode('utf-8')).hexdigest()
     
     def read_to_pandas(self, query: Optional[Dict[str, Any]] = None, limit: int = 1000) -> pd.DataFrame:
         """Read MongoDB data into a pandas DataFrame using pymongo.
@@ -36,18 +72,71 @@ class MongoDataReader:
         Returns:
             pandas DataFrame containing the data
         """
-        docs = mongo_conn.read_with_pymongo(
-            mongo_uri=self.mongo_uri,
-            database=self.database,
-            collection=self.collection,
-            query=query or {},
-            limit=limit
-        )
+        start_time = time.time()
+        error_occurred = False
+        error_message = None
+        record_count = 0
         
-        if not docs:
-            return pd.DataFrame()
-        
-        return pd.DataFrame(docs)
+        try:
+            docs = mongo_conn.read_with_pymongo(
+                mongo_uri=self.mongo_uri,
+                database=self.database,
+                collection=self.collection,
+                query=query or {},
+                limit=limit
+            )
+            
+            if not docs:
+                df = pd.DataFrame()
+            else:
+                df = pd.DataFrame(docs)
+                record_count = len(df)
+            
+            # Compute schema fingerprint
+            schema_fingerprint = self._compute_schema_fingerprint(df)
+            
+            # Calculate latency
+            latency_ms = (time.time() - start_time) * 1000
+            
+            # Emit success event
+            self.logger.info(
+                "MongoDB read completed",
+                extra={
+                    'event_type': 'mongo_read_success',
+                    'database': self.database,
+                    'collection': self.collection,
+                    'query': query,
+                    'limit': limit,
+                    'record_count': record_count,
+                    'schema_fingerprint': schema_fingerprint,
+                    'latency_ms': round(latency_ms, 2),
+                    'columns': list(df.columns) if not df.empty else []
+                }
+            )
+            
+            return df
+            
+        except Exception as e:
+            error_occurred = True
+            error_message = str(e)
+            latency_ms = (time.time() - start_time) * 1000
+            
+            # Emit error event
+            self.logger.error(
+                f"MongoDB read failed: {error_message}",
+                exc_info=True,
+                extra={
+                    'event_type': 'mongo_read_error',
+                    'database': self.database,
+                    'collection': self.collection,
+                    'query': query,
+                    'limit': limit,
+                    'error_message': error_message,
+                    'latency_ms': round(latency_ms, 2)
+                }
+            )
+            
+            raise
     
     def read_to_spark(self, query: Optional[Dict[str, Any]] = None, limit: Optional[int] = None):
         """Read MongoDB data into a Spark DataFrame.
@@ -59,37 +148,115 @@ class MongoDataReader:
         Returns:
             Tuple of (Spark DataFrame, SparkSession)
         """
-        from pyspark.sql import SparkSession
+        start_time = time.time()
+        error_occurred = False
+        error_message = None
         
-        # Create SparkSession with MongoDB connector
-        spark = (
-            SparkSession.builder
-            .appName("mongo-etl-reader")
-            .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:3.0.1")
-            .config("spark.mongodb.input.uri", self.mongo_uri)
-            .config("spark.mongodb.output.uri", self.mongo_uri)
-            .getOrCreate()
-        )
-        
-        # Build reader
-        reader = (
-            spark.read.format("mongo")
-            .option("uri", self.mongo_uri)
-            .option("database", self.database) 
-            .option("collection", self.collection)
-        )
-        
-        # Add query filter if provided
-        if query:
-            reader = reader.option("pipeline", json.dumps([{"$match": query}]))
-        
-        df = reader.load()
-        
-        # Apply limit if specified
-        if limit:
-            df = df.limit(limit)
+        try:
+            from pyspark.sql import SparkSession
             
-        return df, spark
+            # Create SparkSession with MongoDB connector
+            spark = (
+                SparkSession.builder
+                .appName("mongo-etl-reader")
+                .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:3.0.1")
+                .config("spark.mongodb.input.uri", self.mongo_uri)
+                .config("spark.mongodb.output.uri", self.mongo_uri)
+                .getOrCreate()
+            )
+            
+            # Build reader
+            reader = (
+                spark.read.format("mongo")
+                .option("uri", self.mongo_uri)
+                .option("database", self.database) 
+                .option("collection", self.collection)
+            )
+            
+            # Add query filter if provided
+            if query:
+                reader = reader.option("pipeline", json.dumps([{"$match": query}]))
+            
+            df = reader.load()
+            
+            # Apply limit if specified
+            if limit:
+                df = df.limit(limit)
+            
+            # Get record count and schema info
+            record_count = df.count()
+            schema_fingerprint = self._compute_schema_fingerprint_from_spark(df)
+            latency_ms = (time.time() - start_time) * 1000
+            
+            # Emit success event
+            self.logger.info(
+                "MongoDB Spark read completed",
+                extra={
+                    'event_type': 'mongo_spark_read_success',
+                    'database': self.database,
+                    'collection': self.collection,
+                    'query': query,
+                    'limit': limit,
+                    'record_count': record_count,
+                    'schema_fingerprint': schema_fingerprint,
+                    'latency_ms': round(latency_ms, 2)
+                }
+            )
+            
+            return df, spark
+            
+        except Exception as e:
+            error_occurred = True
+            error_message = str(e)
+            latency_ms = (time.time() - start_time) * 1000
+            
+            # Emit error event
+            self.logger.error(
+                f"MongoDB Spark read failed: {error_message}",
+                exc_info=True,
+                extra={
+                    'event_type': 'mongo_spark_read_error',
+                    'database': self.database,
+                    'collection': self.collection,
+                    'query': query,
+                    'limit': limit,
+                    'error_message': error_message,
+                    'latency_ms': round(latency_ms, 2)
+                }
+            )
+            
+            raise
+    
+    def _compute_schema_fingerprint_from_spark(self, df) -> str:
+        """Compute schema fingerprint from Spark DataFrame.
+        
+        Args:
+            df: Spark DataFrame to fingerprint
+            
+        Returns:
+            SHA256 hash of sorted keys and basic types
+        """
+        try:
+            schema_parts = []
+            for field in sorted(df.schema.fields, key=lambda f: f.name):
+                dtype = str(field.dataType)
+                # Normalize to basic types
+                if 'IntegerType' in dtype or 'LongType' in dtype:
+                    dtype = 'integer'
+                elif 'FloatType' in dtype or 'DoubleType' in dtype:
+                    dtype = 'float'
+                elif 'BooleanType' in dtype:
+                    dtype = 'boolean'
+                elif 'TimestampType' in dtype or 'DateType' in dtype:
+                    dtype = 'datetime'
+                else:
+                    dtype = 'string'
+                schema_parts.append(f"{field.name}:{dtype}")
+            
+            schema_str = "|".join(schema_parts)
+            return hashlib.sha256(schema_str.encode('utf-8')).hexdigest()
+        except Exception:
+            return hashlib.sha256(b"unknown").hexdigest()
     
     def read(self, use_spark: bool = False, query: Optional[Dict[str, Any]] = None, limit: Optional[int] = None) -> Union[pd.DataFrame, Tuple[Any, Any]]:
         """Read data using either pandas or Spark based on preference.

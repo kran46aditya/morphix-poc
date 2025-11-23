@@ -14,13 +14,18 @@ import io
 import avro.schema
 import fastavro
 import pymongo
-import logging
+import os
+from pathlib import Path
+from ..utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class SchemaGenerator:
     """Generates schemas from DataFrames or parses Avro schema files."""
+    
+    # Default metadata directory (configurable via METADATA_BASE env var)
+    METADATA_BASE = Path(os.getenv("METADATA_BASE", "/metadata"))
     
     # Mapping from pandas dtypes to our schema types
     DTYPE_MAPPING = {
@@ -39,13 +44,17 @@ class SchemaGenerator:
     
     @classmethod
     def generate_from_dataframe(cls, df: pd.DataFrame, sample_size: int = 1000, 
-                              include_constraints: bool = True) -> Dict[str, Any]:
+                              include_constraints: bool = True, 
+                              collection: Optional[str] = None,
+                              save_to_metadata: bool = True) -> Dict[str, Any]:
         """Generate schema by analyzing a DataFrame sample.
         
         Args:
             df: Input DataFrame to analyze
             sample_size: Number of rows to sample for analysis
             include_constraints: Whether to include min/max constraints
+            collection: Collection name for saving schema (optional)
+            save_to_metadata: Whether to save schema to metadata directory
             
         Returns:
             Schema dictionary compatible with DataTransformer
@@ -65,8 +74,76 @@ class SchemaGenerator:
             col_data = sample_df[column]
             col_schema = cls._analyze_column(col_data, include_constraints)
             schema[column] = col_schema
+        
+        # Save schema to metadata if requested
+        if save_to_metadata and collection:
+            cls._save_schema_to_metadata(schema, collection)
             
         return schema
+    
+    @classmethod
+    def _compute_schema_hash(cls, schema: Dict[str, Any]) -> str:
+        """Compute hash of schema for versioning.
+        
+        Args:
+            schema: Schema dictionary
+            
+        Returns:
+            SHA256 hash of schema
+        """
+        import hashlib
+        schema_str = json.dumps(schema, sort_keys=True, default=str)
+        return hashlib.sha256(schema_str.encode('utf-8')).hexdigest()
+    
+    @classmethod
+    def _save_schema_to_metadata(cls, schema: Dict[str, Any], collection: str):
+        """Save inferred schema to metadata directory.
+        
+        Args:
+            schema: Schema dictionary to save
+            collection: Collection name for directory structure
+        """
+        try:
+            # Create metadata directory structure
+            metadata_dir = cls.METADATA_BASE / "schemas" / collection
+            metadata_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Generate timestamp-based filename
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+            schema_file = metadata_dir / f"{timestamp}.json"
+            
+            # Prepare schema document
+            schema_doc = {
+                "collection": collection,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "schema": schema,
+                "field_count": len(schema)
+            }
+            
+            # Write to file
+            with open(schema_file, 'w') as f:
+                json.dump(schema_doc, f, indent=2, default=str)
+            
+            logger.info(
+                f"Schema saved to {schema_file}",
+                extra={
+                    'event_type': 'schema_saved',
+                    'collection': collection,
+                    'schema_file': str(schema_file),
+                    'field_count': len(schema)
+                }
+            )
+            
+        except Exception as e:
+            logger.warning(
+                f"Failed to save schema to metadata: {e}",
+                exc_info=True,
+                extra={
+                    'event_type': 'schema_save_error',
+                    'collection': collection,
+                    'error': str(e)
+                }
+            )
     
     @classmethod
     def _analyze_column(cls, series: pd.Series, include_constraints: bool = True) -> Dict[str, Any]:
@@ -438,8 +515,13 @@ class SchemaGenerator:
             # Convert to DataFrame for analysis
             df = pd.DataFrame(sample_docs)
             
-            # Generate base schema
-            schema = cls.generate_from_dataframe(df, sample_size=len(df))
+            # Generate base schema (and save to metadata)
+            schema = cls.generate_from_dataframe(
+                df, 
+                sample_size=len(df),
+                collection=collection,
+                save_to_metadata=True
+            )
             
             # Analyze nested structures
             suggestions = cls.suggest_flattening_strategy(schema)
@@ -583,6 +665,58 @@ class SchemaGenerator:
         
         # Cap at 100
         return min(score, 100.0)
+    
+    @classmethod
+    def diff_schemas(cls, old_schema: Dict[str, Any], new_schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Compute differences between two schemas.
+        
+        Args:
+            old_schema: Previous schema dictionary
+            new_schema: New schema dictionary
+            
+        Returns:
+            List of diff entries with action, field, old_type, new_type
+        """
+        diffs = []
+        
+        old_fields = set(old_schema.keys())
+        new_fields = set(new_schema.keys())
+        
+        # Fields added
+        for field in new_fields - old_fields:
+            diffs.append({
+                "action": "add",
+                "field": field,
+                "old_type": None,
+                "new_type": new_schema[field].get('type', 'unknown')
+            })
+        
+        # Fields removed
+        for field in old_fields - new_fields:
+            diffs.append({
+                "action": "remove",
+                "field": field,
+                "old_type": old_schema[field].get('type', 'unknown'),
+                "new_type": None
+            })
+        
+        # Fields with type changes
+        for field in old_fields & new_fields:
+            old_field_schema = old_schema[field]
+            new_field_schema = new_schema[field]
+            
+            old_type = old_field_schema.get('type', 'unknown')
+            new_type = new_field_schema.get('type', 'unknown')
+            
+            if old_type != new_type:
+                diffs.append({
+                    "action": "type_change",
+                    "field": field,
+                    "old_type": old_type,
+                    "new_type": new_type
+                })
+        
+        return diffs
     
     @classmethod
     def detect_breaking_changes(
